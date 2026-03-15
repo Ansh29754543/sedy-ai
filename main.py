@@ -13,7 +13,6 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# ── Groq client ────────────────────────────────────────────────────────
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 SYSTEM_PROMPT = """You are Sedy, an intelligent student learning assistant made by Ansh Verma, a school student.
@@ -27,6 +26,7 @@ MODEL = "llama-3.3-70b-versatile"
 # ── Request models ─────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     message: str
+    history: list = []  # conversation history
 
 class FlashcardRequest(BaseModel):
     topic: str
@@ -37,29 +37,34 @@ class QuizRequest(BaseModel):
     difficulty: str = "medium"
     count: int = 5
 
-# ── Generate helper ────────────────────────────────────────────────────
-def generate(system, user, max_tokens=1024):
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user}
-        ],
-        max_tokens=max_tokens,
-        temperature=0.7
-    )
-    return response.choices[0].message.content.strip()
-
 # ── Health check ───────────────────────────────────────────────────────
 @app.get("/")
 async def root():
     return {"status": "Sedy API is live 🚀", "model": MODEL}
 
-# ── Chat ───────────────────────────────────────────────────────────────
+# ── Chat with memory ───────────────────────────────────────────────────
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    reply = generate(SYSTEM_PROMPT, req.message, 1024)
-    return {"reply": reply}
+    # Build messages with full history
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    # Add previous messages (last 10 only to save tokens)
+    for h in req.history[-10:]:
+        messages.append({
+            "role": h.get("role", "user"),
+            "content": h.get("content", "")
+        })
+
+    # Add current message
+    messages.append({"role": "user", "content": req.message})
+
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        max_tokens=1024,
+        temperature=0.7
+    )
+    return {"reply": response.choices[0].message.content.strip()}
 
 # ── Flashcards ─────────────────────────────────────────────────────────
 @app.post("/flashcards")
@@ -68,13 +73,24 @@ async def flashcards(req: FlashcardRequest):
 Return ONLY a JSON array, no extra text, no markdown:
 [{{"question": "...", "answer": "..."}}, ...]"""
 
-    raw = generate(SYSTEM_PROMPT, user_prompt, 1200)
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ],
+        max_tokens=1200,
+        temperature=0.7
+    )
+    raw = response.choices[0].message.content.strip()
+
     try:
         start = raw.find('[')
         end = raw.rfind(']') + 1
         cards = json.loads(raw[start:end])
     except:
         cards = [{"question": f"What is {req.topic}?", "answer": raw[:300]}]
+
     return {"cards": cards}
 
 # ── Quiz ───────────────────────────────────────────────────────────────
@@ -85,7 +101,17 @@ Return ONLY a JSON array, no extra text, no markdown:
 [{{"question": "...", "options": ["A", "B", "C", "D"], "answer": 0, "explanation": "..."}}]
 "answer" is the index (0-3) of the correct option."""
 
-    raw = generate(SYSTEM_PROMPT, user_prompt, 1500)
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ],
+        max_tokens=1500,
+        temperature=0.7
+    )
+    raw = response.choices[0].message.content.strip()
+
     try:
         start = raw.find('[')
         end = raw.rfind(']') + 1
@@ -97,4 +123,5 @@ Return ONLY a JSON array, no extra text, no markdown:
             "answer": 0,
             "explanation": raw[:300]
         }]
+
     return {"questions": questions}
