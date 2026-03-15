@@ -5,6 +5,7 @@ from groq import Groq
 import json
 import os
 import logging
+import base64
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -684,3 +685,120 @@ async def quiz(req: QuizRequest):
 
     logger.info(f"/quiz  generated {len(questions)} questions")
     return QuizResponse(questions=questions, topic=topic, difficulty=difficulty)
+
+
+# ── PDF Chat ───────────────────────────────────────────────────────────────────
+
+class PdfChatRequest(BaseModel):
+    message: str
+    pdf_base64: str                    # base64-encoded PDF bytes from frontend
+    pdf_name: str = "document.pdf"
+    history: list[HistoryEntry] = []
+
+
+class PdfChatResponse(BaseModel):
+    reply: str
+    pdf_name: str
+
+
+PDF_SYSTEM_PROMPT = """You are Sedy, an intelligent student learning assistant made by Ansh Verma.
+The user has uploaded a PDF document. Your job is to help them understand it.
+
+You can:
+- Answer questions about the document's content
+- Summarize sections or the whole document
+- Explain concepts mentioned in the document
+- Generate study notes from the document
+- When asked for flashcards or a quiz, describe the key topics clearly so the frontend can generate them
+
+STRICT MATH FORMATTING RULES:
+- ALL mathematical expressions MUST use LaTeX delimiters: $...$ for inline, $$...$$ for display
+- NEVER write bare math like: w^2, dC/dw — always wrap in $...$
+- Use \\frac{}{} for fractions, _{} for subscripts
+
+Always be encouraging, clear, and educational.
+Only answer based on the document content. If something is not in the document, say so."""
+
+
+@app.post("/pdf-chat", response_model=PdfChatResponse)
+async def pdf_chat(req: PdfChatRequest):
+    """
+    Accept a base64-encoded PDF and a user question.
+    Extracts text from the PDF using pypdf (pure Python, no system deps),
+    then sends the content + question to the LLM.
+    """
+    pdf_name = req.pdf_name.strip() or "document.pdf"
+    logger.info(f"/pdf-chat  file={pdf_name!r}  msg={req.message[:80]!r}  history={len(req.history)}")
+
+    # ── Step 1: Decode and extract text from PDF ───────────────────────────────
+    try:
+        pdf_bytes = base64.b64decode(req.pdf_base64)
+    except Exception as e:
+        logger.error(f"/pdf-chat  base64 decode failed: {e}")
+        raise HTTPException(status_code=400, detail="Invalid base64 PDF data")
+
+    pdf_text = ""
+    try:
+        from pypdf import PdfReader
+        import io
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        page_count = len(reader.pages)
+        for i, page in enumerate(reader.pages):
+            page_text = page.extract_text() or ""
+            pdf_text += f"\n--- Page {i+1} ---\n{page_text}"
+        logger.info(f"/pdf-chat  extracted {len(pdf_text)} chars from {page_count} pages")
+    except Exception as e:
+        logger.error(f"/pdf-chat  PDF text extraction failed: {e}")
+        raise HTTPException(status_code=422, detail=f"Could not read PDF: {str(e)}")
+
+    if not pdf_text.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="The PDF appears to be empty or contains only scanned images (no extractable text). "
+                   "Please try a text-based PDF."
+        )
+
+    # ── Step 2: Trim PDF text to fit context window ────────────────────────────
+    # Groq llama-3.3-70b has 128k context; we use ~60k chars of PDF text safely
+    MAX_PDF_CHARS = 60_000
+    if len(pdf_text) > MAX_PDF_CHARS:
+        pdf_text = pdf_text[:MAX_PDF_CHARS] + "\n\n[... document truncated to fit context ...]"
+        logger.warning(f"/pdf-chat  PDF text truncated to {MAX_PDF_CHARS} chars")
+
+    # ── Step 3: Build messages ─────────────────────────────────────────────────
+    doc_context = (
+        f"The user has uploaded a PDF named \"{pdf_name}\".\n"
+        f"Here is the full text content of the document:\n"
+        f"=== START OF DOCUMENT ===\n{pdf_text}\n=== END OF DOCUMENT ===\n"
+    )
+
+    messages = [{"role": "system", "content": PDF_SYSTEM_PROMPT + "\n\n" + doc_context}]
+
+    # Add conversation history (last 10 turns)
+    trimmed = req.history[-10:] if len(req.history) > 10 else req.history
+    sanitised: list[dict] = []
+    for entry in trimmed:
+        role = entry.role if entry.role in ("user", "assistant") else "user"
+        if sanitised and sanitised[-1]["role"] == role:
+            sanitised[-1]["content"] += "\n" + entry.content
+        else:
+            sanitised.append({"role": role, "content": entry.content})
+    messages.extend(sanitised)
+
+    messages.append({"role": "user", "content": req.message})
+
+    # ── Step 4: Call Groq ──────────────────────────────────────────────────────
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            max_tokens=1500,
+            temperature=0.7,
+        )
+    except Exception as e:
+        logger.error(f"Groq API error in /pdf-chat: {e}")
+        raise HTTPException(status_code=502, detail=f"Groq API error: {str(e)}")
+
+    reply = response.choices[0].message.content.strip()
+    logger.info(f"/pdf-chat  reply_len={len(reply)}")
+    return PdfChatResponse(reply=reply, pdf_name=pdf_name)
