@@ -1,0 +1,1443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sedy — AI Student Assistant</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #080b12;
+    --bg2: #0d1120;
+    --bg3: #121828;
+    --card: #141a28;
+    --card2: #1a2235;
+    --border: #1e2d45;
+    --border2: #243350;
+    --accent: #4f8eff;
+    --accent2: #7c5cfc;
+    --accent3: #00e5c0;
+    --text: #e8edf5;
+    --text2: #8899bb;
+    --text3: #4a5a7a;
+    --danger: #ff4f6a;
+    --success: #00e5a0;
+    --warning: #ffb547;
+    --glow: 0 0 40px rgba(79,142,255,0.15);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'DM Sans', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Background grid */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(79,142,255,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(79,142,255,0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* Glow orbs */
+  .orb {
+    position: fixed;
+    border-radius: 50%;
+    filter: blur(80px);
+    pointer-events: none;
+    z-index: 0;
+  }
+  .orb1 { width: 400px; height: 400px; background: rgba(79,142,255,0.06); top: -100px; right: -100px; }
+  .orb2 { width: 300px; height: 300px; background: rgba(124,92,252,0.06); bottom: 100px; left: -100px; }
+
+  /* Layout */
+  .app { display: flex; height: 100vh; position: relative; z-index: 1; }
+
+  /* Sidebar */
+  .sidebar {
+    width: 240px;
+    min-width: 240px;
+    background: var(--bg2);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    padding: 24px 0;
+  }
+
+  .logo {
+    padding: 0 20px 28px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 20px;
+  }
+
+  .logo-text {
+    font-family: 'Syne', sans-serif;
+    font-size: 26px;
+    font-weight: 800;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    letter-spacing: -0.5px;
+  }
+
+  .logo-sub {
+    font-size: 11px;
+    color: var(--text3);
+    font-family: 'DM Mono', monospace;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    margin-top: 2px;
+  }
+
+  .nav { flex: 1; padding: 0 12px; }
+
+  .nav-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 11px 14px;
+    border-radius: 10px;
+    cursor: pointer;
+    color: var(--text2);
+    font-size: 14px;
+    font-weight: 500;
+    transition: all 0.2s;
+    margin-bottom: 4px;
+    border: 1px solid transparent;
+  }
+
+  .nav-item:hover { background: var(--card); color: var(--text); }
+
+  .nav-item.active {
+    background: linear-gradient(135deg, rgba(79,142,255,0.15), rgba(124,92,252,0.1));
+    color: var(--accent);
+    border-color: rgba(79,142,255,0.2);
+  }
+
+  .nav-icon { font-size: 18px; width: 22px; text-align: center; }
+
+  .sidebar-footer {
+    padding: 16px 20px 0;
+    border-top: 1px solid var(--border);
+    margin-top: auto;
+  }
+
+  .made-by {
+    font-size: 11px;
+    color: var(--text3);
+    font-family: 'DM Mono', monospace;
+  }
+
+  .made-by span { color: var(--accent2); }
+
+  /* Main content */
+  .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* Page header */
+  .page-header {
+    padding: 24px 32px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .page-title {
+    font-family: 'Syne', sans-serif;
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--text);
+  }
+
+  .page-subtitle { font-size: 13px; color: var(--text3); margin-top: 2px; }
+
+  .api-badge {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    font-size: 12px;
+    color: var(--text2);
+    font-family: 'DM Mono', monospace;
+  }
+
+  .api-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--text3);
+    transition: all 0.3s;
+  }
+
+  .api-dot.connected { background: var(--success); box-shadow: 0 0 8px var(--success); }
+
+  /* Pages */
+  .page { display: none; flex: 1; overflow-y: auto; padding: 28px 32px; }
+  .page.active { display: block; }
+
+  /* =================== CHAT =================== */
+  #chat-page { display: none; flex-direction: column; padding: 0; }
+  #chat-page.active { display: flex; }
+
+  .chat-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 28px 32px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  .chat-messages::-webkit-scrollbar { width: 4px; }
+  .chat-messages::-webkit-scrollbar-track { background: transparent; }
+  .chat-messages::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+  .msg { display: flex; gap: 12px; max-width: 75%; animation: msgIn 0.3s ease; }
+
+  @keyframes msgIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .msg.user { align-self: flex-end; flex-direction: row-reverse; }
+
+  .msg-avatar {
+    width: 34px; height: 34px;
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px; flex-shrink: 0;
+  }
+
+  .msg.ai .msg-avatar { background: linear-gradient(135deg, var(--accent), var(--accent2)); }
+  .msg.user .msg-avatar { background: var(--card2); border: 1px solid var(--border2); }
+
+  .msg-bubble {
+    padding: 13px 16px;
+    border-radius: 14px;
+    font-size: 14px;
+    line-height: 1.6;
+  }
+
+  .msg.ai .msg-bubble {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-top-left-radius: 4px;
+    color: var(--text);
+  }
+
+  .msg.user .msg-bubble {
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    color: white;
+    border-top-right-radius: 4px;
+  }
+
+  .typing-indicator { display: flex; gap: 5px; padding: 6px 0; }
+  .typing-dot {
+    width: 7px; height: 7px;
+    background: var(--accent);
+    border-radius: 50%;
+    animation: typingBounce 1.2s infinite;
+  }
+  .typing-dot:nth-child(2) { animation-delay: 0.2s; }
+  .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes typingBounce {
+    0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+    30% { transform: translateY(-6px); opacity: 1; }
+  }
+
+  .chat-input-area {
+    padding: 20px 32px 24px;
+    border-top: 1px solid var(--border);
+    background: var(--bg2);
+  }
+
+  .chat-input-wrap {
+    display: flex;
+    align-items: flex-end;
+    gap: 12px;
+    background: var(--card);
+    border: 1px solid var(--border2);
+    border-radius: 14px;
+    padding: 12px 16px;
+    transition: border-color 0.2s;
+  }
+
+  .chat-input-wrap:focus-within { border-color: var(--accent); box-shadow: var(--glow); }
+
+  #chat-input {
+    flex: 1;
+    background: none;
+    border: none;
+    outline: none;
+    color: var(--text);
+    font-size: 14px;
+    font-family: 'DM Sans', sans-serif;
+    resize: none;
+    max-height: 120px;
+    line-height: 1.5;
+  }
+
+  #chat-input::placeholder { color: var(--text3); }
+
+  .send-btn {
+    width: 36px; height: 36px;
+    border-radius: 9px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    border: none;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px;
+    transition: all 0.2s;
+    flex-shrink: 0;
+  }
+
+  .send-btn:hover { transform: scale(1.05); box-shadow: 0 4px 15px rgba(79,142,255,0.4); }
+
+  .api-url-bar {
+    display: flex; gap: 10px; margin-bottom: 14px; align-items: center;
+  }
+
+  #api-url {
+    flex: 1;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    color: var(--text2);
+    font-family: 'DM Mono', monospace;
+    font-size: 12px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+
+  #api-url:focus { border-color: var(--accent); }
+
+  .connect-btn {
+    padding: 8px 16px;
+    background: var(--card2);
+    border: 1px solid var(--border2);
+    border-radius: 8px;
+    color: var(--text);
+    font-size: 12px;
+    cursor: pointer;
+    font-family: 'DM Sans', sans-serif;
+    transition: all 0.2s;
+    white-space: nowrap;
+  }
+
+  .connect-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* =================== FLASHCARDS =================== */
+  .fc-controls {
+    display: flex; gap: 12px; margin-bottom: 28px; flex-wrap: wrap; align-items: center;
+  }
+
+  .fc-input {
+    flex: 1;
+    min-width: 200px;
+    background: var(--card);
+    border: 1px solid var(--border2);
+    border-radius: 10px;
+    padding: 11px 16px;
+    color: var(--text);
+    font-size: 14px;
+    font-family: 'DM Sans', sans-serif;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+
+  .fc-input:focus { border-color: var(--accent); }
+  .fc-input::placeholder { color: var(--text3); }
+
+  .btn-primary {
+    padding: 11px 22px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    border: none;
+    border-radius: 10px;
+    color: white;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: 'DM Sans', sans-serif;
+    transition: all 0.2s;
+    white-space: nowrap;
+  }
+
+  .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(79,142,255,0.3); }
+  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+  .btn-secondary {
+    padding: 11px 22px;
+    background: var(--card2);
+    border: 1px solid var(--border2);
+    border-radius: 10px;
+    color: var(--text);
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: 'DM Sans', sans-serif;
+    transition: all 0.2s;
+  }
+
+  .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* Flashcard deck */
+  .fc-deck {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 20px;
+  }
+
+  .flashcard {
+    height: 180px;
+    perspective: 1000px;
+    cursor: pointer;
+  }
+
+  .fc-inner {
+    width: 100%; height: 100%;
+    position: relative;
+    transform-style: preserve-3d;
+    transition: transform 0.55s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  .flashcard.flipped .fc-inner { transform: rotateY(180deg); }
+
+  .fc-front, .fc-back {
+    position: absolute; inset: 0;
+    backface-visibility: hidden;
+    border-radius: 14px;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    border: 1px solid var(--border);
+  }
+
+  .fc-front {
+    background: var(--card);
+    background-image: linear-gradient(135deg, rgba(79,142,255,0.05) 0%, transparent 60%);
+  }
+
+  .fc-back {
+    background: linear-gradient(135deg, rgba(79,142,255,0.12), rgba(124,92,252,0.08));
+    border-color: rgba(79,142,255,0.25);
+    transform: rotateY(180deg);
+  }
+
+  .fc-label {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--text3);
+  }
+
+  .fc-front .fc-label { color: var(--accent); }
+  .fc-back .fc-label { color: var(--accent3); }
+
+  .fc-text {
+    font-size: 15px;
+    color: var(--text);
+    line-height: 1.5;
+    font-weight: 500;
+    flex: 1;
+    display: flex;
+    align-items: center;
+    margin: 10px 0;
+  }
+
+  .fc-hint {
+    font-size: 11px;
+    color: var(--text3);
+    text-align: right;
+  }
+
+  .fc-empty {
+    grid-column: 1/-1;
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--text3);
+  }
+
+  .fc-empty-icon { font-size: 40px; margin-bottom: 12px; }
+  .fc-empty-text { font-size: 15px; }
+
+  /* Loading spinner */
+  .spinner {
+    width: 18px; height: 18px;
+    border: 2px solid rgba(255,255,255,0.2);
+    border-top-color: white;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    display: inline-block;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* =================== QUIZ =================== */
+  .quiz-setup { max-width: 560px; }
+
+  .quiz-setup h2 {
+    font-family: 'Syne', sans-serif;
+    font-size: 18px;
+    font-weight: 700;
+    margin-bottom: 20px;
+    color: var(--text);
+  }
+
+  .quiz-field { margin-bottom: 16px; }
+
+  .quiz-label {
+    font-size: 12px;
+    color: var(--text2);
+    font-family: 'DM Mono', monospace;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+    display: block;
+  }
+
+  .quiz-select, .quiz-input-field {
+    width: 100%;
+    background: var(--card);
+    border: 1px solid var(--border2);
+    border-radius: 10px;
+    padding: 11px 16px;
+    color: var(--text);
+    font-size: 14px;
+    font-family: 'DM Sans', sans-serif;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+
+  .quiz-select:focus, .quiz-input-field:focus { border-color: var(--accent); }
+  .quiz-select option { background: var(--card); }
+
+  /* Quiz active */
+  .quiz-active { max-width: 680px; }
+
+  .quiz-progress-bar {
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    margin-bottom: 28px;
+    overflow: hidden;
+  }
+
+  .quiz-progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    border-radius: 2px;
+    transition: width 0.5s ease;
+  }
+
+  .quiz-q-num {
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    color: var(--text3);
+    letter-spacing: 1px;
+    margin-bottom: 12px;
+    text-transform: uppercase;
+  }
+
+  .quiz-question {
+    font-family: 'Syne', sans-serif;
+    font-size: 20px;
+    font-weight: 600;
+    line-height: 1.4;
+    margin-bottom: 28px;
+    color: var(--text);
+  }
+
+  .quiz-options { display: flex; flex-direction: column; gap: 12px; margin-bottom: 24px; }
+
+  .quiz-option {
+    padding: 14px 18px;
+    background: var(--card);
+    border: 1px solid var(--border2);
+    border-radius: 12px;
+    cursor: pointer;
+    font-size: 14px;
+    color: var(--text);
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .quiz-option:hover:not(.disabled) { border-color: var(--accent); background: var(--card2); }
+
+  .quiz-option.correct {
+    border-color: var(--success);
+    background: rgba(0,229,160,0.08);
+    color: var(--success);
+  }
+
+  .quiz-option.wrong {
+    border-color: var(--danger);
+    background: rgba(255,79,106,0.08);
+    color: var(--danger);
+  }
+
+  .quiz-option.disabled { cursor: default; }
+
+  .opt-letter {
+    width: 26px; height: 26px;
+    border-radius: 6px;
+    background: var(--bg3);
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'DM Mono', monospace;
+    font-size: 12px;
+    font-weight: 500;
+    flex-shrink: 0;
+  }
+
+  .quiz-option.correct .opt-letter { background: rgba(0,229,160,0.2); }
+  .quiz-option.wrong .opt-letter { background: rgba(255,79,106,0.2); }
+
+  .quiz-explanation {
+    padding: 14px 16px;
+    background: rgba(79,142,255,0.06);
+    border: 1px solid rgba(79,142,255,0.15);
+    border-radius: 10px;
+    font-size: 13px;
+    color: var(--text2);
+    line-height: 1.6;
+    margin-bottom: 20px;
+    display: none;
+  }
+
+  /* Quiz results */
+  .quiz-result {
+    text-align: center;
+    padding: 40px 20px;
+    max-width: 480px;
+    margin: 0 auto;
+  }
+
+  .result-score {
+    font-family: 'Syne', sans-serif;
+    font-size: 72px;
+    font-weight: 800;
+    background: linear-gradient(135deg, var(--accent), var(--accent3));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    line-height: 1;
+    margin-bottom: 8px;
+  }
+
+  .result-label { font-size: 16px; color: var(--text2); margin-bottom: 32px; }
+
+  .result-stats {
+    display: flex;
+    gap: 16px;
+    justify-content: center;
+    margin-bottom: 32px;
+  }
+
+  .result-stat {
+    padding: 16px 24px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    text-align: center;
+  }
+
+  .result-stat-num {
+    font-family: 'Syne', sans-serif;
+    font-size: 24px;
+    font-weight: 700;
+  }
+
+  .result-stat-num.green { color: var(--success); }
+  .result-stat-num.red { color: var(--danger); }
+  .result-stat-label { font-size: 12px; color: var(--text3); margin-top: 2px; }
+
+  /* =================== CHARTS =================== */
+  .charts-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+  }
+
+  .chart-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 24px;
+  }
+
+  .chart-card.wide { grid-column: 1 / -1; }
+
+  .chart-title {
+    font-family: 'Syne', sans-serif;
+    font-size: 15px;
+    font-weight: 700;
+    margin-bottom: 4px;
+    color: var(--text);
+  }
+
+  .chart-subtitle { font-size: 12px; color: var(--text3); margin-bottom: 20px; }
+
+  .chart-wrap { position: relative; }
+
+  .stats-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-bottom: 20px;
+  }
+
+  .stat-box {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px;
+  }
+
+  .stat-box-val {
+    font-family: 'Syne', sans-serif;
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--accent);
+  }
+
+  .stat-box-label { font-size: 12px; color: var(--text3); margin-top: 4px; }
+
+  .stat-box-change {
+    font-size: 11px;
+    color: var(--success);
+    margin-top: 2px;
+    font-family: 'DM Mono', monospace;
+  }
+
+  /* Scrollbar */
+  .page::-webkit-scrollbar { width: 4px; }
+  .page::-webkit-scrollbar-track { background: transparent; }
+  .page::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+  /* Responsive */
+  @media (max-width: 768px) {
+    .sidebar { display: none; }
+    .charts-grid { grid-template-columns: 1fr; }
+    .stats-row { grid-template-columns: 1fr 1fr; }
+    .chart-card.wide { grid-column: 1; }
+  }
+</style>
+</head>
+<body>
+
+<div class="orb orb1"></div>
+<div class="orb orb2"></div>
+
+<div class="app">
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="logo">
+      <div class="logo-text">Sedy</div>
+      <div class="logo-sub">AI Student Assistant</div>
+    </div>
+    <nav class="nav">
+      <div class="nav-item active" onclick="switchPage('chat')">
+        <span class="nav-icon">💬</span> Chat with Sedy
+      </div>
+      <div class="nav-item" onclick="switchPage('flashcards')">
+        <span class="nav-icon">🃏</span> Flashcards
+      </div>
+      <div class="nav-item" onclick="switchPage('quiz')">
+        <span class="nav-icon">📝</span> Quizzes
+      </div>
+      <div class="nav-item" onclick="switchPage('charts')">
+        <span class="nav-icon">📊</span> Progress Charts
+      </div>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="made-by">Made by <span>Ansh Verma</span></div>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <main class="main">
+
+    <!-- Header -->
+    <div class="page-header">
+      <div>
+        <div class="page-title" id="page-title">Chat with Sedy</div>
+        <div class="page-subtitle" id="page-subtitle">Ask anything — concepts, problems, summaries</div>
+      </div>
+      <div class="api-badge">
+        <div class="api-dot" id="api-dot"></div>
+        <span id="api-status">Not connected</span>
+      </div>
+    </div>
+
+    <!-- CHAT PAGE -->
+    <div class="page active" id="chat-page">
+      <div class="chat-messages" id="chat-messages">
+        <div class="msg ai">
+          <div class="msg-avatar">🤖</div>
+          <div class="msg-bubble">
+            Hey! I'm <strong>Sedy</strong>, your AI study companion made by Ansh Verma 👋<br><br>
+            I can help you understand concepts, solve problems, create flashcards and quizzes, and much more. What would you like to learn today?
+          </div>
+        </div>
+      </div>
+      <div class="chat-input-area">
+        <div class="api-url-bar">
+          <input id="api-url" type="text" placeholder="Paste your API URL (e.g. https://xxxx.ngrok.io)" />
+          <button class="connect-btn" onclick="connectAPI()">Connect</button>
+        </div>
+        <div class="chat-input-wrap">
+          <textarea id="chat-input" rows="1" placeholder="Ask Sedy anything..." onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+          <button class="send-btn" onclick="sendMessage()">➤</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- FLASHCARDS PAGE -->
+    <div class="page" id="flashcards-page">
+      <div class="fc-controls">
+        <input class="fc-input" id="fc-topic" type="text" placeholder="Enter a topic (e.g. Photosynthesis, World War 2, Python loops...)" />
+        <button class="btn-primary" id="fc-gen-btn" onclick="generateFlashcards()">
+          ✨ Generate Cards
+        </button>
+        <button class="btn-secondary" onclick="clearFlashcards()">Clear</button>
+      </div>
+      <div class="fc-deck" id="fc-deck">
+        <div class="fc-empty">
+          <div class="fc-empty-icon">🃏</div>
+          <div class="fc-empty-text">Enter a topic above to generate flashcards</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- QUIZ PAGE -->
+    <div class="page" id="quiz-page">
+      <div class="quiz-setup" id="quiz-setup">
+        <h2>Create a Quiz</h2>
+        <div class="quiz-field">
+          <label class="quiz-label">TOPIC</label>
+          <input class="quiz-input-field" id="quiz-topic" type="text" placeholder="e.g. Newton's Laws of Motion" />
+        </div>
+        <div class="quiz-field">
+          <label class="quiz-label">DIFFICULTY</label>
+          <select class="quiz-select" id="quiz-difficulty">
+            <option value="easy">Easy</option>
+            <option value="medium" selected>Medium</option>
+            <option value="hard">Hard</option>
+          </select>
+        </div>
+        <div class="quiz-field">
+          <label class="quiz-label">NUMBER OF QUESTIONS</label>
+          <select class="quiz-select" id="quiz-count">
+            <option value="3">3 Questions</option>
+            <option value="5" selected>5 Questions</option>
+            <option value="10">10 Questions</option>
+          </select>
+        </div>
+        <button class="btn-primary" id="quiz-gen-btn" onclick="generateQuiz()" style="width:100%;margin-top:8px;">
+          🚀 Start Quiz
+        </button>
+      </div>
+
+      <div class="quiz-active" id="quiz-active" style="display:none;">
+        <div class="quiz-progress-bar">
+          <div class="quiz-progress-fill" id="quiz-progress"></div>
+        </div>
+        <div class="quiz-q-num" id="quiz-q-num">Question 1 of 5</div>
+        <div class="quiz-question" id="quiz-question"></div>
+        <div class="quiz-options" id="quiz-options"></div>
+        <div class="quiz-explanation" id="quiz-explanation"></div>
+        <button class="btn-primary" id="quiz-next-btn" onclick="nextQuestion()" style="display:none;">
+          Next →
+        </button>
+      </div>
+
+      <div class="quiz-result" id="quiz-result" style="display:none;">
+        <div class="result-score" id="result-score">0%</div>
+        <div class="result-label" id="result-label">Keep practicing!</div>
+        <div class="result-stats">
+          <div class="result-stat">
+            <div class="result-stat-num green" id="result-correct">0</div>
+            <div class="result-stat-label">Correct</div>
+          </div>
+          <div class="result-stat">
+            <div class="result-stat-num red" id="result-wrong">0</div>
+            <div class="result-stat-label">Wrong</div>
+          </div>
+        </div>
+        <button class="btn-primary" onclick="resetQuiz()">Try Another Quiz</button>
+      </div>
+    </div>
+
+    <!-- CHARTS PAGE -->
+    <div class="page" id="charts-page">
+      <div class="stats-row">
+        <div class="stat-box">
+          <div class="stat-box-val" id="stat-sessions">0</div>
+          <div class="stat-box-label">Study Sessions</div>
+          <div class="stat-box-change">↑ tracked</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-box-val" id="stat-cards">0</div>
+          <div class="stat-box-label">Cards Generated</div>
+          <div class="stat-box-change">↑ total</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-box-val" id="stat-quizzes">0</div>
+          <div class="stat-box-label">Quizzes Taken</div>
+          <div class="stat-box-change">↑ total</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-box-val" id="stat-avg">0%</div>
+          <div class="stat-box-label">Avg. Quiz Score</div>
+          <div class="stat-box-change">↑ avg</div>
+        </div>
+      </div>
+
+      <div class="charts-grid">
+        <div class="chart-card wide">
+          <div class="chart-title">Quiz Performance Over Time</div>
+          <div class="chart-subtitle">Your score history across all quizzes</div>
+          <div class="chart-wrap"><canvas id="lineChart" height="80"></canvas></div>
+        </div>
+        <div class="chart-card">
+          <div class="chart-title">Topics Studied</div>
+          <div class="chart-subtitle">Breakdown by subject area</div>
+          <div class="chart-wrap"><canvas id="doughnutChart" height="180"></canvas></div>
+        </div>
+        <div class="chart-card">
+          <div class="chart-title">Activity This Week</div>
+          <div class="chart-subtitle">Daily usage pattern</div>
+          <div class="chart-wrap"><canvas id="barChart" height="180"></canvas></div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<script>
+// =================== STATE ===================
+let apiUrl = '';
+let apiConnected = false;
+let quizData = [];
+let quizIdx = 0;
+let quizScore = 0;
+let quizAnswered = false;
+
+const stats = {
+  sessions: 0,
+  cards: 0,
+  quizzes: 0,
+  scores: [],
+  topics: {}
+};
+
+// =================== NAVIGATION ===================
+const pageTitles = {
+  chat: ['Chat with Sedy', 'Ask anything — concepts, problems, summaries'],
+  flashcards: ['Flashcards', 'Generate and study interactive flashcards'],
+  quiz: ['Quizzes', 'Test your knowledge with AI-generated quizzes'],
+  charts: ['Progress Charts', 'Track your learning journey over time']
+};
+
+function switchPage(page) {
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.page').forEach(el => el.classList.remove('active'));
+  event.currentTarget.classList.add('active');
+  document.getElementById(`${page}-page`).classList.add('active');
+  document.getElementById('page-title').textContent = pageTitles[page][0];
+  document.getElementById('page-subtitle').textContent = pageTitles[page][1];
+  if (page === 'charts') updateCharts();
+}
+
+// =================== API ===================
+function connectAPI() {
+  const url = document.getElementById('api-url').value.trim();
+  if (!url) return;
+  apiUrl = url.replace(/\/$/, '');
+  apiConnected = true;
+  document.getElementById('api-dot').classList.add('connected');
+  document.getElementById('api-status').textContent = 'Connected';
+  addMessage('ai', '✅ Connected to your Sedy API! I\'m ready to help you study.');
+  stats.sessions++;
+}
+
+// =================== CHAT ===================
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+}
+
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+}
+
+function addMessage(role, text) {
+  const wrap = document.getElementById('chat-messages');
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+  div.innerHTML = `
+    <div class="msg-avatar">${role === 'ai' ? '🤖' : '👤'}</div>
+    <div class="msg-bubble">${text}</div>
+  `;
+  wrap.appendChild(div);
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+function showTyping() {
+  const wrap = document.getElementById('chat-messages');
+  const div = document.createElement('div');
+  div.className = 'msg ai'; div.id = 'typing';
+  div.innerHTML = `
+    <div class="msg-avatar">🤖</div>
+    <div class="msg-bubble"><div class="typing-indicator">
+      <div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div>
+    </div></div>
+  `;
+  wrap.appendChild(div);
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+function removeTyping() {
+  const t = document.getElementById('typing');
+  if (t) t.remove();
+}
+
+async function sendMessage() {
+  const input = document.getElementById('chat-input');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  input.style.height = 'auto';
+  addMessage('user', text);
+
+  if (!apiConnected) {
+    showTyping();
+    setTimeout(() => {
+      removeTyping();
+      addMessage('ai', '⚠️ Please connect your API first by pasting your backend URL above and clicking <strong>Connect</strong>.');
+    }, 800);
+    return;
+  }
+
+  showTyping();
+  try {
+    const res = await fetch(`${apiUrl}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text })
+    });
+    const data = await res.json();
+    removeTyping();
+    addMessage('ai', data.reply || data.response || data.text || 'Sorry, I could not get a response.');
+  } catch (err) {
+    removeTyping();
+    addMessage('ai', `❌ Could not reach the API. Make sure your backend is running at <code>${apiUrl}</code>`);
+  }
+}
+
+// =================== FLASHCARDS ===================
+async function generateFlashcards() {
+  const topic = document.getElementById('fc-topic').value.trim();
+  if (!topic) return;
+
+  const btn = document.getElementById('fc-gen-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Generating...';
+
+  const deck = document.getElementById('fc-deck');
+  deck.innerHTML = '';
+
+  try {
+    let cards = [];
+
+    if (apiConnected) {
+      const res = await fetch(`${apiUrl}/flashcards`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ topic, count: 6 })
+      });
+      const data = await res.json();
+      cards = data.cards || data.flashcards || [];
+    }
+
+    // Fallback demo cards if no API
+    if (!cards.length) {
+      cards = getDemoFlashcards(topic);
+    }
+
+    stats.cards += cards.length;
+    if (!stats.topics[topic]) stats.topics[topic] = 0;
+    stats.topics[topic] += cards.length;
+
+    cards.forEach((card, i) => {
+      const el = document.createElement('div');
+      el.className = 'flashcard';
+      el.style.animationDelay = `${i * 0.08}s`;
+      el.innerHTML = `
+        <div class="fc-inner">
+          <div class="fc-front">
+            <div class="fc-label">Question</div>
+            <div class="fc-text">${card.question || card.front}</div>
+            <div class="fc-hint">Click to reveal →</div>
+          </div>
+          <div class="fc-back">
+            <div class="fc-label">Answer</div>
+            <div class="fc-text">${card.answer || card.back}</div>
+            <div class="fc-hint">Click to flip back</div>
+          </div>
+        </div>
+      `;
+      el.onclick = () => el.classList.toggle('flipped');
+      deck.appendChild(el);
+    });
+
+  } catch (err) {
+    const cards = getDemoFlashcards(topic);
+    stats.cards += cards.length;
+    cards.forEach((card, i) => {
+      const el = document.createElement('div');
+      el.className = 'flashcard';
+      el.innerHTML = `
+        <div class="fc-inner">
+          <div class="fc-front">
+            <div class="fc-label">Question</div>
+            <div class="fc-text">${card.question}</div>
+            <div class="fc-hint">Click to reveal →</div>
+          </div>
+          <div class="fc-back">
+            <div class="fc-label">Answer</div>
+            <div class="fc-text">${card.answer}</div>
+            <div class="fc-hint">Click to flip back</div>
+          </div>
+        </div>
+      `;
+      el.onclick = () => el.classList.toggle('flipped');
+      deck.appendChild(el);
+    });
+  }
+
+  btn.disabled = false;
+  btn.innerHTML = '✨ Generate Cards';
+}
+
+function getDemoFlashcards(topic) {
+  return [
+    { question: `What is the main concept of ${topic}?`, answer: `Connect your API to get AI-generated answers about ${topic}` },
+    { question: `Give an example of ${topic} in real life.`, answer: `Connect your API for detailed examples of ${topic}` },
+    { question: `What are the key facts about ${topic}?`, answer: `Your Sedy AI will provide accurate facts once connected` },
+    { question: `How does ${topic} work?`, answer: `Connect the backend API to get step-by-step explanations` },
+    { question: `Why is ${topic} important?`, answer: `Sedy will explain the importance and applications of ${topic}` },
+    { question: `What are common misconceptions about ${topic}?`, answer: `AI-powered answers available after connecting your backend` },
+  ];
+}
+
+function clearFlashcards() {
+  document.getElementById('fc-deck').innerHTML = `
+    <div class="fc-empty">
+      <div class="fc-empty-icon">🃏</div>
+      <div class="fc-empty-text">Enter a topic above to generate flashcards</div>
+    </div>`;
+  document.getElementById('fc-topic').value = '';
+}
+
+// =================== QUIZ ===================
+async function generateQuiz() {
+  const topic = document.getElementById('quiz-topic').value.trim();
+  const difficulty = document.getElementById('quiz-difficulty').value;
+  const count = parseInt(document.getElementById('quiz-count').value);
+  if (!topic) return;
+
+  const btn = document.getElementById('quiz-gen-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Generating Quiz...';
+
+  try {
+    let questions = [];
+
+    if (apiConnected) {
+      const res = await fetch(`${apiUrl}/quiz`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ topic, difficulty, count })
+      });
+      const data = await res.json();
+      questions = data.questions || data.quiz || [];
+    }
+
+    if (!questions.length) {
+      questions = getDemoQuiz(topic, count);
+    }
+
+    quizData = questions;
+    quizIdx = 0;
+    quizScore = 0;
+
+    if (!stats.topics[topic]) stats.topics[topic] = 0;
+    stats.topics[topic]++;
+
+    document.getElementById('quiz-setup').style.display = 'none';
+    document.getElementById('quiz-active').style.display = 'block';
+    renderQuestion();
+
+  } catch (err) {
+    quizData = getDemoQuiz(topic, count);
+    quizIdx = 0; quizScore = 0;
+    document.getElementById('quiz-setup').style.display = 'none';
+    document.getElementById('quiz-active').style.display = 'block';
+    renderQuestion();
+  }
+
+  btn.disabled = false;
+  btn.innerHTML = '🚀 Start Quiz';
+}
+
+function getDemoQuiz(topic, count) {
+  const base = [
+    {
+      question: `Which best describes the core idea of ${topic}?`,
+      options: ['Option A (connect API for real questions)', 'Option B', 'Option C', 'Option D'],
+      answer: 0,
+      explanation: `Connect your Sedy backend to get real AI-generated quiz questions about ${topic}.`
+    },
+    {
+      question: `What is a key characteristic of ${topic}?`,
+      options: ['Connect API for real answer', 'Option B', 'Option C', 'Option D'],
+      answer: 0,
+      explanation: `Your AI model will generate accurate questions and explanations once connected.`
+    },
+    {
+      question: `${topic} is primarily associated with which field?`,
+      options: ['Connect API for real answer', 'Science', 'History', 'Mathematics'],
+      answer: 0,
+      explanation: `Real questions powered by your fine-tuned Sedy model.`
+    },
+    {
+      question: `Which statement about ${topic} is correct?`,
+      options: ['Connect API for real answer', 'Statement B', 'Statement C', 'Statement D'],
+      answer: 0,
+      explanation: `Accurate AI explanations available after connecting backend.`
+    },
+    {
+      question: `What is an application of ${topic}?`,
+      options: ['Connect API for real answer', 'Application B', 'Application C', 'Application D'],
+      answer: 0,
+      explanation: `Sedy will provide real-world applications once your API is connected.`
+    }
+  ];
+  return base.slice(0, count);
+}
+
+function renderQuestion() {
+  const q = quizData[quizIdx];
+  const total = quizData.length;
+  const letters = ['A', 'B', 'C', 'D', 'E'];
+
+  document.getElementById('quiz-progress').style.width = `${(quizIdx / total) * 100}%`;
+  document.getElementById('quiz-q-num').textContent = `Question ${quizIdx + 1} of ${total}`;
+  document.getElementById('quiz-question').textContent = q.question;
+  document.getElementById('quiz-explanation').style.display = 'none';
+  document.getElementById('quiz-next-btn').style.display = 'none';
+  quizAnswered = false;
+
+  const opts = document.getElementById('quiz-options');
+  opts.innerHTML = '';
+  q.options.forEach((opt, i) => {
+    const el = document.createElement('div');
+    el.className = 'quiz-option';
+    el.innerHTML = `<div class="opt-letter">${letters[i]}</div>${opt}`;
+    el.onclick = () => answerQuiz(i);
+    opts.appendChild(el);
+  });
+}
+
+function answerQuiz(idx) {
+  if (quizAnswered) return;
+  quizAnswered = true;
+
+  const q = quizData[quizIdx];
+  const opts = document.querySelectorAll('.quiz-option');
+
+  opts.forEach((el, i) => {
+    el.classList.add('disabled');
+    if (i === q.answer) el.classList.add('correct');
+    else if (i === idx && idx !== q.answer) el.classList.add('wrong');
+  });
+
+  if (idx === q.answer) quizScore++;
+
+  if (q.explanation) {
+    const expEl = document.getElementById('quiz-explanation');
+    expEl.textContent = `💡 ${q.explanation}`;
+    expEl.style.display = 'block';
+  }
+
+  document.getElementById('quiz-next-btn').style.display = 'block';
+  document.getElementById('quiz-next-btn').textContent =
+    quizIdx + 1 < quizData.length ? 'Next →' : 'See Results';
+}
+
+function nextQuestion() {
+  quizIdx++;
+  if (quizIdx < quizData.length) {
+    renderQuestion();
+  } else {
+    showResults();
+  }
+}
+
+function showResults() {
+  const total = quizData.length;
+  const pct = Math.round((quizScore / total) * 100);
+
+  stats.quizzes++;
+  stats.scores.push(pct);
+
+  document.getElementById('quiz-active').style.display = 'none';
+  document.getElementById('quiz-result').style.display = 'block';
+  document.getElementById('result-score').textContent = `${pct}%`;
+  document.getElementById('result-correct').textContent = quizScore;
+  document.getElementById('result-wrong').textContent = total - quizScore;
+
+  const labels = ['Keep practicing! 💪', 'Good effort! 📚', 'Well done! ⭐', 'Excellent! 🎉', 'Perfect! 🏆'];
+  document.getElementById('result-label').textContent =
+    pct < 40 ? labels[0] : pct < 60 ? labels[1] : pct < 80 ? labels[2] : pct < 100 ? labels[3] : labels[4];
+}
+
+function resetQuiz() {
+  document.getElementById('quiz-result').style.display = 'none';
+  document.getElementById('quiz-setup').style.display = 'block';
+  document.getElementById('quiz-topic').value = '';
+}
+
+// =================== CHARTS ===================
+let chartsInit = false;
+let lineChart, doughnutChart, barChart;
+
+function updateCharts() {
+  // Update stats
+  document.getElementById('stat-sessions').textContent = stats.sessions;
+  document.getElementById('stat-cards').textContent = stats.cards;
+  document.getElementById('stat-quizzes').textContent = stats.quizzes;
+  const avg = stats.scores.length
+    ? Math.round(stats.scores.reduce((a, b) => a + b, 0) / stats.scores.length)
+    : 0;
+  document.getElementById('stat-avg').textContent = avg + '%';
+
+  const chartDefaults = {
+    color: '#8899bb',
+    borderColor: '#1e2d45',
+  };
+
+  Chart.defaults.color = chartDefaults.color;
+
+  // Line chart — quiz scores
+  const lineData = stats.scores.length
+    ? stats.scores
+    : [65, 72, 68, 80, 75, 88, 82];
+
+  const lineLabels = lineData.map((_, i) => `Quiz ${i + 1}`);
+
+  if (!chartsInit) {
+    const lineCtx = document.getElementById('lineChart').getContext('2d');
+    lineChart = new Chart(lineCtx, {
+      type: 'line',
+      data: {
+        labels: lineLabels,
+        datasets: [{
+          label: 'Score %',
+          data: lineData,
+          borderColor: '#4f8eff',
+          backgroundColor: 'rgba(79,142,255,0.08)',
+          borderWidth: 2,
+          pointBackgroundColor: '#4f8eff',
+          pointRadius: 4,
+          tension: 0.4,
+          fill: true
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { grid: { color: '#1e2d45' } },
+          y: { grid: { color: '#1e2d45' }, min: 0, max: 100 }
+        }
+      }
+    });
+
+    // Doughnut — topics
+    const topicKeys = Object.keys(stats.topics).length
+      ? Object.keys(stats.topics)
+      : ['Math', 'Science', 'History', 'Programming', 'General'];
+    const topicVals = Object.values(stats.topics).length
+      ? Object.values(stats.topics)
+      : [30, 25, 20, 15, 10];
+
+    const dCtx = document.getElementById('doughnutChart').getContext('2d');
+    doughnutChart = new Chart(dCtx, {
+      type: 'doughnut',
+      data: {
+        labels: topicKeys,
+        datasets: [{
+          data: topicVals,
+          backgroundColor: ['#4f8eff', '#7c5cfc', '#00e5c0', '#ffb547', '#ff4f6a'],
+          borderWidth: 0,
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { position: 'bottom', labels: { padding: 16, boxWidth: 12 } } },
+        cutout: '65%'
+      }
+    });
+
+    // Bar — weekly activity
+    const bCtx = document.getElementById('barChart').getContext('2d');
+    barChart = new Chart(bCtx, {
+      type: 'bar',
+      data: {
+        labels: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+        datasets: [{
+          label: 'Sessions',
+          data: [2, 4, 3, 5, 2, 6, 3],
+          backgroundColor: 'rgba(79,142,255,0.6)',
+          borderRadius: 6,
+          borderSkipped: false,
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { grid: { display: false } },
+          y: { grid: { color: '#1e2d45' } }
+        }
+      }
+    });
+
+    chartsInit = true;
+
+  } else {
+    lineChart.data.labels = lineLabels;
+    lineChart.data.datasets[0].data = lineData;
+    lineChart.update();
+  }
+}
+</script>
+</body>
+</html>
