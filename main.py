@@ -14,19 +14,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(me
 logger = logging.getLogger("sedy")
 
 # ── App ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Sedy API", version="2.5.0")
+app = FastAPI(title="Sedy API", version="2.6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ── Groq clients ───────────────────────────────────────────────────────────────
+# ── Groq client ────────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 if not GROQ_API_KEY:
     logger.warning("GROQ_API_KEY is not set — API calls will fail!")
 
 client = Groq(api_key=GROQ_API_KEY)
 
-# Smart model routing — use 70B for chat/graphs, 8B for flashcards/quiz/PDF (saves ~10x tokens)
-MODEL_SMART = "llama-3.3-70b-versatile"   # chat, graphs, refinement
-MODEL_FAST  = "llama-3.1-8b-instant"      # flashcards, quiz, PDF summarisation
+# Single model for all tasks
+MODEL = "llama-3.3-70b-versatile"
 
 # Optional: Serper.dev key for live web data on graphs
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
@@ -163,7 +162,7 @@ Only answer based on the document content. If something isn't in the document, s
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HistoryEntry(BaseModel):
-    role: str        # "user" or "assistant"
+    role: str
     content: str
 
 class ChatRequest(BaseModel):
@@ -183,7 +182,6 @@ class QuizRequest(BaseModel):
 
 class GraphRequest(BaseModel):
     message: str
-    # chart_type kept for backwards compat but ignored — AI decides autonomously
     chart_type: str = "auto"
     history: list[HistoryEntry] = []
 
@@ -225,16 +223,23 @@ class GraphSeries(BaseModel):
 
 class GraphResponse(BaseModel):
     title: str
-    chart_type: str = "line"      # "line" | "bar" | "pie" — decided by AI
+    chart_type: str = "line"
     unit: str = ""
     x_label: str = ""
     caption: str = ""
-    data_source: str = ""         # "live" | "estimated"
+    data_source: str = ""
     series: list[GraphSeries]
 
 class PdfChatResponse(BaseModel):
     reply: str
     pdf_name: str
+
+class IntentRequest(BaseModel):
+    message: str
+    history: list[HistoryEntry] = []
+
+class IntentResponse(BaseModel):
+    intent: str
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -242,7 +247,6 @@ class PdfChatResponse(BaseModel):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_messages(system: str, history: list[HistoryEntry], user_message: str) -> list[dict]:
-    """Build the messages array with sanitised alternating roles."""
     messages = [{"role": "system", "content": system}]
     trimmed = history[-20:] if len(history) > 20 else history
     sanitised: list[dict] = []
@@ -258,7 +262,6 @@ def build_messages(system: str, history: list[HistoryEntry], user_message: str) 
 
 
 def extract_json_array(raw: str) -> list:
-    """Extract a JSON array from a string that may contain markdown fences."""
     raw = raw.strip()
     if raw.startswith("```"):
         raw = raw.split("```", 2)[1]
@@ -273,7 +276,6 @@ def extract_json_array(raw: str) -> list:
 
 
 def strip_json_fences(raw: str) -> str:
-    """Strip markdown code fences from a JSON object string."""
     raw = raw.strip()
     if raw.startswith("```"):
         raw = raw.split("```", 2)[1]
@@ -297,10 +299,6 @@ def is_vague_topic(topic: str) -> bool:
 
 
 def resolve_topic_from_history(raw_topic: str, history: list[HistoryEntry]) -> str:
-    """
-    If raw_topic is vague, scan history to find the last concrete subject.
-    Priority: assistant summary → user message → heading in assistant reply.
-    """
     if not is_vague_topic(raw_topic):
         return raw_topic
     if not history:
@@ -308,49 +306,30 @@ def resolve_topic_from_history(raw_topic: str, history: list[HistoryEntry]) -> s
 
     rev = list(reversed(history))
 
-    # 1. Assistant messages that record "flashcards/quiz about X"
     for entry in rev:
         if entry.role == "assistant":
             m = re.search(r'(?:flashcards?|quiz)\s+(?:about|on)\s+([^\n.!?]{3,60})', entry.content, re.I)
             if m:
-                logger.info(f"resolve_topic → assistant log: {m.group(1).strip()!r}")
                 return m.group(1).strip()
 
-    # 2. User messages — strip action words
     action_words = r'flashcards?|flash\s*cards?|quiz(zes)?|make|create|generate|about|on|me|test|cards?|and\b|a\b|the\b'
     for entry in rev:
         if entry.role == "user":
             cleaned = re.sub(action_words, '', entry.content, flags=re.I).strip()
             if cleaned and not is_vague_topic(cleaned) and len(cleaned) > 2:
-                logger.info(f"resolve_topic → user message: {cleaned!r}")
                 return cleaned
 
-    # 3. Heading in last assistant reply
     for entry in rev:
         if entry.role == "assistant":
             m = re.search(r'(?:^|\n)#{1,3}\s+(?:introduction to\s+)?([A-Za-z][^\n]{2,50})', entry.content, re.I)
             if m:
-                logger.info(f"resolve_topic → heading: {m.group(1).strip()!r}")
                 return m.group(1).strip()
 
-    logger.warning(f"resolve_topic: could not resolve {raw_topic!r}")
     return raw_topic
 
 
-# ── Generic prompt refiner ────────────────────────────────────────────────────
-
 async def refine_prompt(message: str, history: list[HistoryEntry],
                         system_prompt: str = REFINE_SYSTEM_PROMPT) -> str:
-    """
-    Silently refine the user's message:
-      1. Fix spelling/typos
-      2. Fix grammar
-      3. Resolve vague context references from history
-
-    The user NEVER sees this — the frontend always displays the original message.
-    Falls back to the original on any error.
-    Accepts an optional custom system_prompt so graph requests use GRAPH_REFINE_SYSTEM_PROMPT.
-    """
     if not message or not message.strip():
         return message
 
@@ -369,7 +348,7 @@ async def refine_prompt(message: str, history: list[HistoryEntry],
 
     try:
         response = client.chat.completions.create(
-            model=MODEL_SMART,
+            model=MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": user_content},
@@ -378,33 +357,20 @@ async def refine_prompt(message: str, history: list[HistoryEntry],
             temperature=0.2,
         )
         refined = response.choices[0].message.content.strip()
-
-        # Safety: if output is suspiciously long, fall back
         if not refined or len(refined) > len(message) * 5:
-            logger.warning(f"refine_prompt: suspicious output, falling back")
             return message
-
         logger.info(f"refine: '{message[:50]}' → '{refined[:50]}'")
         return refined
-
     except Exception as e:
         logger.warning(f"refine_prompt failed ({e}), using original")
         return message
 
 
 async def refine_graph_prompt(message: str, history: list[HistoryEntry]) -> str:
-    """Graph-specific refinement using GRAPH_REFINE_SYSTEM_PROMPT."""
     return await refine_prompt(message, history, system_prompt=GRAPH_REFINE_SYSTEM_PROMPT)
 
 
-# ── Live web search for real-time graph data ──────────────────────────────────
-
 async def fetch_live_data(query: str) -> str:
-    """
-    Fetch real-time search snippets via Serper.dev.
-    Returns a string of snippets to inject into the graph prompt,
-    or empty string if SERPER_API_KEY is not set.
-    """
     if not SERPER_API_KEY:
         return ""
     try:
@@ -415,7 +381,6 @@ async def fetch_live_data(query: str) -> str:
                 json={"q": query, "num": 5},
             )
             if resp.status_code != 200:
-                logger.warning(f"Serper returned {resp.status_code}")
                 return ""
             data = resp.json()
             snippets = []
@@ -424,9 +389,7 @@ async def fetch_live_data(query: str) -> str:
                 snippet = r.get("snippet", "")
                 if title or snippet:
                     snippets.append(f"• {title}: {snippet}")
-            result = "\n".join(snippets)
-            logger.info(f"live_data: {len(snippets)} snippets for {query!r}")
-            return result
+            return "\n".join(snippets)
     except Exception as e:
         logger.warning(f"live_data failed: {e}")
         return ""
@@ -440,37 +403,24 @@ async def fetch_live_data(query: str) -> str:
 async def root():
     return {
         "status": "Sedy API is live 🚀",
-        "version": "2.5.0",
-        "model_smart": MODEL_SMART,
-        "model_fast": MODEL_FAST,
+        "version": "2.6.0",
+        "model": MODEL,
         "live_data": bool(SERPER_API_KEY),
-        "endpoints": ["/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat"],
+        "endpoints": ["/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat", "/intent"],
     }
 
 
-# ── /chat ──────────────────────────────────────────────────────────────────────
-
-# ── Intent detection models ───────────────────────────────────────────────────
+# ── /intent ────────────────────────────────────────────────────────────────────
 
 INTENT_SYSTEM_PROMPT = """You are an intent classifier for a student learning app called Sedy.
 Read the user's message and the recent conversation history, then output EXACTLY one word — nothing else.
 
 The possible intents are:
   graph      — user wants a chart, graph, or data visualisation of any kind.
-               This includes: asking about prices, trends, comparisons, expenditures, distributions,
-               growth over time, sector-wise breakdowns, historical data, market share, statistics,
-               "show me", "plot", "visualize", or any request where a visual data chart would be
-               the most useful response. Also includes vague follow-ups like "a chart", "show it",
-               "now as a pie" when the conversation context is about data.
-
   flashcard  — user wants to generate flip cards to study a topic.
-
   quiz       — user wants a multiple-choice quiz on a topic.
-
   both       — user wants BOTH flashcards AND a quiz on the same topic.
-
-  chat       — everything else: explanations, questions, math problems, coding help,
-               summaries, definitions, general conversation.
+  chat       — everything else: explanations, questions, math problems, coding help, summaries, definitions, general conversation.
 
 RULES:
 - Output ONLY one of these five words: graph, flashcard, quiz, both, chat
@@ -479,26 +429,10 @@ RULES:
 - When in doubt between chat and graph, prefer graph if the topic involves any kind of data or statistics."""
 
 
-class IntentRequest(BaseModel):
-    message: str
-    history: list[HistoryEntry] = []
-
-
-class IntentResponse(BaseModel):
-    intent: str
-
-
 @app.post("/intent", response_model=IntentResponse)
 async def detect_intent(req: IntentRequest):
-    """
-    AI-powered intent classification. No keyword matching — the model reads the
-    message and conversation history and returns one of:
-    graph | flashcard | quiz | both | chat
-    Uses MODEL_FAST for speed and low token cost (~50 tokens per call).
-    """
     logger.info(f"/intent  msg={req.message[:80]!r}")
 
-    # Build a compact history snippet (last 6 turns is enough for context)
     history_snippet = ""
     if req.history:
         lines = []
@@ -514,31 +448,27 @@ async def detect_intent(req: IntentRequest):
 
     try:
         response = client.chat.completions.create(
-            model=MODEL_FAST,
+            model=MODEL,
             messages=[
                 {"role": "system", "content": INTENT_SYSTEM_PROMPT},
                 {"role": "user",   "content": user_content},
             ],
-            max_tokens=5,       # only needs 1 word
-            temperature=0.0,    # deterministic
+            max_tokens=5,
+            temperature=0.0,
         )
         raw = response.choices[0].message.content.strip().lower()
-        # Sanitise — only accept known intents
         intent = raw if raw in ("graph", "flashcard", "quiz", "both", "chat") else "chat"
-        logger.info(f"/intent  result={intent!r}  raw={raw!r}")
+        logger.info(f"/intent  result={intent!r}")
         return IntentResponse(intent=intent)
-
     except Exception as e:
         logger.warning(f"/intent  failed ({e}), defaulting to chat")
         return IntentResponse(intent="chat")
 
 
+# ── /chat ──────────────────────────────────────────────────────────────────────
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    """
-    Main chat endpoint. Silently refines the message before sending to the model.
-    Uses MODEL_SMART (70B) for best quality responses.
-    """
     logger.info(f"/chat  history={len(req.history)}  msg={req.message[:80]!r}")
 
     refined = await refine_prompt(req.message, req.history)
@@ -546,7 +476,7 @@ async def chat(req: ChatRequest):
 
     try:
         response = client.chat.completions.create(
-            model=MODEL_SMART,
+            model=MODEL,
             messages=messages,
             max_tokens=1024,
             temperature=0.7,
@@ -564,10 +494,8 @@ async def chat(req: ChatRequest):
 
 @app.post("/flashcards", response_model=FlashcardResponse)
 async def flashcards(req: FlashcardRequest):
-    """
-    Generate flashcards. Uses MODEL_FAST (8B) to save tokens.
-    Silently refines topic and resolves vague references.
-    """
+    logger.info(f"/flashcards  topic={req.topic!r}")
+
     topic_as_prompt = f"Generate flashcards about {req.topic.strip()}"
     refined = await refine_prompt(topic_as_prompt, req.history)
 
@@ -579,7 +507,6 @@ async def flashcards(req: FlashcardRequest):
         raise HTTPException(status_code=400, detail="topic must not be empty")
 
     count = max(1, min(req.count, 20))
-    logger.info(f"/flashcards  topic={topic!r}  count={count}")
 
     user_prompt = (
         f'Generate exactly {count} flashcards about "{topic}".\n'
@@ -589,7 +516,7 @@ async def flashcards(req: FlashcardRequest):
 
     try:
         response = client.chat.completions.create(
-            model=MODEL_FAST,
+            model=MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": user_prompt},
@@ -623,10 +550,8 @@ async def flashcards(req: FlashcardRequest):
 
 @app.post("/quiz", response_model=QuizResponse)
 async def quiz(req: QuizRequest):
-    """
-    Generate MCQ quiz. Uses MODEL_FAST (8B) to save tokens.
-    Silently refines topic and resolves vague references.
-    """
+    logger.info(f"/quiz  topic={req.topic!r}")
+
     topic_as_prompt = f"Quiz me on {req.topic.strip()}"
     refined = await refine_prompt(topic_as_prompt, req.history)
 
@@ -639,7 +564,6 @@ async def quiz(req: QuizRequest):
 
     difficulty = req.difficulty if req.difficulty in ("easy", "medium", "hard") else "medium"
     count = max(1, min(req.count, 20))
-    logger.info(f"/quiz  topic={topic!r}  difficulty={difficulty}  count={count}")
 
     user_prompt = (
         f'Generate exactly {count} {difficulty} MCQs about "{topic}".\n'
@@ -649,7 +573,7 @@ async def quiz(req: QuizRequest):
 
     try:
         response = client.chat.completions.create(
-            model=MODEL_FAST,
+            model=MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": user_prompt},
@@ -694,23 +618,11 @@ async def quiz(req: QuizRequest):
 
 @app.post("/graph", response_model=GraphResponse)
 async def graph(req: GraphRequest):
-    """
-    Generate structured chart data. The AI autonomously decides whether to use
-    a line, bar, or pie chart based on the nature of the request.
-
-    Pipeline:
-      1. Graph-specific prompt refinement (spelling + grammar + context resolution + chart type hint)
-      2. Optional live data fetch via Serper.dev (if SERPER_API_KEY is set)
-      3. AI generates full JSON with chart_type, series, unit, title, caption
-    """
     logger.info(f"/graph  msg={req.message[:80]!r}")
 
-    # Step 1 — Graph-specific refinement (uses GRAPH_REFINE_SYSTEM_PROMPT)
-    # This also appends a chart type hint like "(pie chart)" when the phrasing implies it
     refined = await refine_graph_prompt(req.message, req.history)
     logger.info(f"/graph  refined='{refined[:80]}'")
 
-    # Step 2 — Optional live data fetch
     live_snippets = ""
     data_source = "estimated"
     if SERPER_API_KEY:
@@ -718,9 +630,7 @@ async def graph(req: GraphRequest):
         live_snippets = await fetch_live_data(search_query)
         if live_snippets:
             data_source = "live"
-            logger.info(f"/graph  live data: {len(live_snippets)} chars")
 
-    # Step 3 — Build user content for the graph AI
     if live_snippets:
         user_content = (
             f"User request: {refined}\n\n"
@@ -731,17 +641,15 @@ async def graph(req: GraphRequest):
     else:
         user_content = refined
 
-    messages = [
-        {"role": "system", "content": GRAPH_SYSTEM_PROMPT},
-        {"role": "user",   "content": user_content},
-    ]
-
     try:
         response = client.chat.completions.create(
-            model=MODEL_SMART,
-            messages=messages,
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": GRAPH_SYSTEM_PROMPT},
+                {"role": "user",   "content": user_content},
+            ],
             max_tokens=2500,
-            temperature=0.3,   # low temp for consistent structured JSON
+            temperature=0.3,
         )
     except Exception as e:
         logger.error(f"Groq error /graph: {e}")
@@ -769,10 +677,8 @@ async def graph(req: GraphRequest):
         if not series_list:
             raise ValueError("No valid series found in model response")
 
-        # Validate chart_type — AI picks it; we just sanitise
         ct = str(obj.get("chart_type", "line")).lower().strip()
         if ct not in ("line", "bar", "pie"):
-            logger.warning(f"/graph  unknown chart_type={ct!r}, defaulting to line")
             ct = "line"
 
         result = GraphResponse(
@@ -784,11 +690,7 @@ async def graph(req: GraphRequest):
             data_source=data_source,
             series=series_list,
         )
-        logger.info(
-            f"/graph  title={result.title!r}  type={ct}  "
-            f"series={len(series_list)}  points={sum(len(s.data) for s in series_list)}  "
-            f"source={data_source}"
-        )
+        logger.info(f"/graph  title={result.title!r}  type={ct}  series={len(series_list)}")
         return result
 
     except Exception as e:
@@ -800,22 +702,16 @@ async def graph(req: GraphRequest):
 
 @app.post("/pdf-chat", response_model=PdfChatResponse)
 async def pdf_chat(req: PdfChatRequest):
-    """
-    PDF Q&A. Extracts text with pypdf, sends to MODEL_FAST (8B) to save tokens.
-    Silently refines the user's message before processing.
-    """
     pdf_name = req.pdf_name.strip() or "document.pdf"
     logger.info(f"/pdf-chat  file={pdf_name!r}  msg={req.message[:80]!r}")
 
     refined_message = await refine_prompt(req.message, req.history)
 
-    # Decode PDF
     try:
         pdf_bytes = base64.b64decode(req.pdf_base64)
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 PDF data")
 
-    # Extract text
     pdf_text = ""
     try:
         from pypdf import PdfReader
@@ -833,11 +729,9 @@ async def pdf_chat(req: PdfChatRequest):
             detail="PDF appears empty or image-only. Please try a text-based PDF."
         )
 
-    # Trim to fit context (~60k chars safe for llama 128k context)
     MAX_PDF_CHARS = 60_000
     if len(pdf_text) > MAX_PDF_CHARS:
         pdf_text = pdf_text[:MAX_PDF_CHARS] + "\n\n[... document truncated to fit context ...]"
-        logger.warning(f"/pdf-chat  truncated to {MAX_PDF_CHARS} chars")
 
     doc_context = (
         f'The user has uploaded a PDF named "{pdf_name}".\n'
@@ -845,7 +739,6 @@ async def pdf_chat(req: PdfChatRequest):
     )
     messages = [{"role": "system", "content": PDF_SYSTEM_PROMPT + "\n\n" + doc_context}]
 
-    # Add last 10 turns of history
     trimmed = req.history[-10:]
     sanitised: list[dict] = []
     for entry in trimmed:
@@ -859,7 +752,7 @@ async def pdf_chat(req: PdfChatRequest):
 
     try:
         response = client.chat.completions.create(
-            model=MODEL_FAST,
+            model=MODEL,
             messages=messages,
             max_tokens=1500,
             temperature=0.7,
