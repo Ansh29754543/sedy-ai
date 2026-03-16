@@ -450,6 +450,89 @@ async def root():
 
 # ── /chat ──────────────────────────────────────────────────────────────────────
 
+# ── Intent detection models ───────────────────────────────────────────────────
+
+INTENT_SYSTEM_PROMPT = """You are an intent classifier for a student learning app called Sedy.
+Read the user's message and the recent conversation history, then output EXACTLY one word — nothing else.
+
+The possible intents are:
+  graph      — user wants a chart, graph, or data visualisation of any kind.
+               This includes: asking about prices, trends, comparisons, expenditures, distributions,
+               growth over time, sector-wise breakdowns, historical data, market share, statistics,
+               "show me", "plot", "visualize", or any request where a visual data chart would be
+               the most useful response. Also includes vague follow-ups like "a chart", "show it",
+               "now as a pie" when the conversation context is about data.
+
+  flashcard  — user wants to generate flip cards to study a topic.
+
+  quiz       — user wants a multiple-choice quiz on a topic.
+
+  both       — user wants BOTH flashcards AND a quiz on the same topic.
+
+  chat       — everything else: explanations, questions, math problems, coding help,
+               summaries, definitions, general conversation.
+
+RULES:
+- Output ONLY one of these five words: graph, flashcard, quiz, both, chat
+- No punctuation, no explanation, no extra words whatsoever.
+- Use conversation history to understand vague follow-ups like "it", "that", "same", "a chart", "show it".
+- When in doubt between chat and graph, prefer graph if the topic involves any kind of data or statistics."""
+
+
+class IntentRequest(BaseModel):
+    message: str
+    history: list[HistoryEntry] = []
+
+
+class IntentResponse(BaseModel):
+    intent: str
+
+
+@app.post("/intent", response_model=IntentResponse)
+async def detect_intent(req: IntentRequest):
+    """
+    AI-powered intent classification. No keyword matching — the model reads the
+    message and conversation history and returns one of:
+    graph | flashcard | quiz | both | chat
+    Uses MODEL_FAST for speed and low token cost (~50 tokens per call).
+    """
+    logger.info(f"/intent  msg={req.message[:80]!r}")
+
+    # Build a compact history snippet (last 6 turns is enough for context)
+    history_snippet = ""
+    if req.history:
+        lines = []
+        for entry in req.history[-6:]:
+            label = "Student" if entry.role == "user" else "Sedy"
+            lines.append(f"{label}: {entry.content[:150]}")
+        history_snippet = "\n".join(lines)
+
+    user_content = (
+        f"Recent conversation:\n{history_snippet}\n\nNew message: {req.message}"
+        if history_snippet else f"Message: {req.message}"
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_FAST,
+            messages=[
+                {"role": "system", "content": INTENT_SYSTEM_PROMPT},
+                {"role": "user",   "content": user_content},
+            ],
+            max_tokens=5,       # only needs 1 word
+            temperature=0.0,    # deterministic
+        )
+        raw = response.choices[0].message.content.strip().lower()
+        # Sanitise — only accept known intents
+        intent = raw if raw in ("graph", "flashcard", "quiz", "both", "chat") else "chat"
+        logger.info(f"/intent  result={intent!r}  raw={raw!r}")
+        return IntentResponse(intent=intent)
+
+    except Exception as e:
+        logger.warning(f"/intent  failed ({e}), defaulting to chat")
+        return IntentResponse(intent="chat")
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     """
