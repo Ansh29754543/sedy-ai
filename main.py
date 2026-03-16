@@ -16,7 +16,7 @@ logging.basicConfig(
 logger = logging.getLogger("sedy")
 
 # ── App ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Sedy API", version="2.2.0")
+app = FastAPI(title="Sedy API", version="2.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,7 +34,10 @@ client = Groq(api_key=GROQ_API_KEY)
 
 MODEL = "llama-3.3-70b-versatile"
 
-# ── System prompt ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ── SYSTEM PROMPTS ────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
 SYSTEM_PROMPT = """You are Sedy, an intelligent student learning assistant made by Ansh Verma, a school student.
 You explain concepts clearly and simply, solve math and science problems step by step,
 summarize topics, and help students understand programming.
@@ -59,7 +62,8 @@ STRICT MATH FORMATTING RULES (critical — the frontend uses KaTeX to render mat
 - For each step in a solution, place the equation on its own line using $$...$$
 - Never write "w squared" in plain text — always $w^2$"""
 
-# ── Prompt Refinement System Prompt ───────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+
 REFINE_SYSTEM_PROMPT = """You are a silent prompt refinement engine. Your ONLY job is to clean up a student's message before it reaches an AI tutor.
 
 You must perform these three tasks in order:
@@ -77,11 +81,67 @@ CRITICAL RULES:
 - If the message is already perfect, output it exactly as-is.
 - Keep it concise — do not expand the message unnecessarily."""
 
+# ──────────────────────────────────────────────────────────────────────────────
 
-# ── Request / Response models ──────────────────────────────────────────────────
+GRAPH_SYSTEM_PROMPT = """You are a data assistant. The user wants a graph or chart.
+Your job is to return ONLY a JSON object — no prose, no markdown fences, no explanation.
+
+Schema:
+{
+  "title": "Short descriptive chart title",
+  "unit": "unit of Y axis, e.g. Rs/kg or USD billions or %",
+  "x_label": "label for X axis, e.g. Year",
+  "caption": "One optional sentence of context or data note (can be empty string)",
+  "series": [
+    {
+      "label": "Series name, e.g. Onion",
+      "data": [
+        {"x": "2000", "y": 8.5},
+        {"x": "2001", "y": 9.0}
+      ]
+    }
+  ]
+}
+
+CRITICAL RULES:
+- Return ONLY valid JSON. Absolutely no explanation, no backticks, no markdown, no preamble.
+- x values MUST be strings (years, months, labels). Example: "2005" not 2005.
+- y values MUST be numbers (floats or ints). Example: 12.5 not "12.5".
+- Use realistic, historically plausible data. If estimating, use well-known approximations.
+- For Indian vegetable/commodity prices use Rs/kg as the unit.
+- For GDP use USD billions or USD trillions as appropriate.
+- Include enough data points for a meaningful chart (minimum 5, ideally 10-20 for time series).
+- If multiple items are requested (e.g. onion AND tomato), include each as a separate series object.
+- Keep series labels short (1-3 words max).
+- Do NOT include any text outside the JSON object."""
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+PDF_SYSTEM_PROMPT = """You are Sedy, an intelligent student learning assistant made by Ansh Verma.
+The user has uploaded a PDF document. Your job is to help them understand it.
+
+You can:
+- Answer questions about the document's content
+- Summarize sections or the whole document
+- Explain concepts mentioned in the document
+- Generate study notes from the document
+- When asked for flashcards or a quiz, describe the key topics clearly so the frontend can generate them
+
+STRICT MATH FORMATTING RULES:
+- ALL mathematical expressions MUST use LaTeX delimiters: $...$ for inline, $$...$$ for display
+- NEVER write bare math like: w^2, dC/dw — always wrap in $...$
+- Use \\frac{}{} for fractions, _{} for subscripts
+
+Always be encouraging, clear, and educational.
+Only answer based on the document content. If something is not in the document, say so."""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── PYDANTIC MODELS ───────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 class HistoryEntry(BaseModel):
-    role: str       # "user" or "assistant"
+    role: str        # "user" or "assistant"
     content: str
 
 
@@ -98,9 +158,27 @@ class FlashcardRequest(BaseModel):
 
 class QuizRequest(BaseModel):
     topic: str
-    difficulty: str = "medium"
+    difficulty: str = "medium"   # "easy" | "medium" | "hard"
     count: int = 5
     history: list[HistoryEntry] = []
+
+
+class GraphRequest(BaseModel):
+    message: str
+    history: list[HistoryEntry] = []
+
+
+class PdfChatRequest(BaseModel):
+    message: str
+    pdf_base64: str
+    pdf_name: str = "document.pdf"
+    history: list[HistoryEntry] = []
+
+
+# ── Response models ────────────────────────────────────────────────────────────
+
+class ChatResponse(BaseModel):
+    reply: str
 
 
 class Flashcard(BaseModel):
@@ -108,20 +186,16 @@ class Flashcard(BaseModel):
     answer: str
 
 
-class QuizQuestion(BaseModel):
-    question: str
-    options: list[str]
-    answer: int
-    explanation: str
-
-
-class ChatResponse(BaseModel):
-    reply: str
-
-
 class FlashcardResponse(BaseModel):
     cards: list[Flashcard]
     topic: str
+
+
+class QuizQuestion(BaseModel):
+    question: str
+    options: list[str]
+    answer: int          # zero-based index of correct option
+    explanation: str
 
 
 class QuizResponse(BaseModel):
@@ -130,74 +204,37 @@ class QuizResponse(BaseModel):
     difficulty: str
 
 
-# ── Prompt Refinement ──────────────────────────────────────────────────────────
-
-async def refine_prompt(message: str, history: list[HistoryEntry]) -> str:
-    """
-    Silently refine the user's message before passing it to the main AI:
-      1. Fix spelling/typos
-      2. Fix grammar
-      3. Resolve vague references using conversation history
-
-    The user never sees this — the frontend displays their original message.
-    Returns the refined message string, falling back to the original on any error.
-    """
-    if not message or not message.strip():
-        return message
-
-    # Build a compact history snippet (last 10 turns) for context
-    history_snippet = ""
-    if history:
-        trimmed = history[-10:]
-        lines = []
-        for entry in trimmed:
-            role_label = "Student" if entry.role == "user" else "Tutor"
-            # Truncate long entries to keep the refine call cheap
-            content_preview = entry.content[:200] + ("..." if len(entry.content) > 200 else "")
-            lines.append(f"{role_label}: {content_preview}")
-        history_snippet = "\n".join(lines)
-
-    # Compose the refine request
-    if history_snippet:
-        user_content = (
-            f"Conversation history so far:\n{history_snippet}\n\n"
-            f"New message to refine: {message}"
-        )
-    else:
-        user_content = f"Message to refine: {message}"
-
-    try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": REFINE_SYSTEM_PROMPT},
-                {"role": "user",   "content": user_content},
-            ],
-            max_tokens=256,
-            temperature=0.2,   # low temperature for deterministic, conservative fixes
-        )
-        refined = response.choices[0].message.content.strip()
-
-        # Safety check: if the model returned something wildly different in length, fall back
-        if not refined or len(refined) > len(message) * 4:
-            logger.warning(f"refine_prompt: suspicious output length, falling back. refined={refined[:80]!r}")
-            return message
-
-        logger.info(f"refine_prompt: '{message[:60]}' → '{refined[:60]}'")
-        return refined
-
-    except Exception as e:
-        # Never let refinement failures block the main request
-        logger.warning(f"refine_prompt: failed ({e}), using original message")
-        return message
+class GraphPoint(BaseModel):
+    x: str      # always string — could be "2005", "Jan", etc.
+    y: float
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+class GraphSeries(BaseModel):
+    label: str
+    data: list[GraphPoint]
+
+
+class GraphResponse(BaseModel):
+    title: str
+    unit: str = ""
+    x_label: str = ""
+    caption: str = ""
+    series: list[GraphSeries]
+
+
+class PdfChatResponse(BaseModel):
+    reply: str
+    pdf_name: str
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 def build_messages(system: str, history: list[HistoryEntry], user_message: str) -> list[dict]:
     """
     Build the messages array for the Groq API.
-    Includes last 20 history entries and sanitises for alternating roles.
+    Includes last 20 history entries, sanitised for alternating roles.
     """
     messages = [{"role": "system", "content": system}]
 
@@ -231,7 +268,18 @@ def extract_json_array(raw: str) -> list:
     return json.loads(raw[start:end])
 
 
-# Phrases that mean "use the topic from our conversation context"
+def strip_json_fences(raw: str) -> str:
+    """Strip markdown fences from a JSON object string."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```", 2)[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.rsplit("```", 1)[0].strip()
+    return raw
+
+
+# Vague topic signals used by context resolution
 VAGUE_TOPIC_SIGNALS = [
     "it", "this", "that", "them", "same", "the same",
     "the topic", "same topic", "this topic", "that topic",
@@ -242,6 +290,7 @@ VAGUE_TOPIC_SIGNALS = [
     "what we discussed", "what i said", "previous", "last topic",
 ]
 
+
 def is_vague_topic(topic: str) -> bool:
     t = topic.strip().lower()
     return any(t == v or t.startswith(v) for v in VAGUE_TOPIC_SIGNALS)
@@ -249,7 +298,14 @@ def is_vague_topic(topic: str) -> bool:
 
 def resolve_topic_from_history(raw_topic: str, history: list[HistoryEntry]) -> str:
     """
-    If raw_topic is vague, scan conversation history to find the last concrete subject.
+    If raw_topic is vague (e.g. "at this basis", "it", "this"),
+    scan the conversation history to find the last concrete subject discussed.
+
+    Priority:
+      1. Last assistant message that mentions "flashcards/quiz about X"
+      2. Last user message with a non-vague topic
+      3. Subject heading in last assistant reply
+      4. Fall back to raw_topic unchanged
     """
     if not is_vague_topic(raw_topic):
         return raw_topic
@@ -259,7 +315,7 @@ def resolve_topic_from_history(raw_topic: str, history: list[HistoryEntry]) -> s
 
     reversed_history = list(reversed(history))
 
-    # 1. Assistant entries that record "Generated N flashcards about X" or "quiz about X"
+    # 1. Assistant entries recording "Generated N flashcards about X" or "quiz about X"
     for entry in reversed_history:
         if entry.role == "assistant":
             m = re.search(r'(?:flashcards?|quiz)\s+(?:about|on)\s+([^\n.!?]{3,60})', entry.content, re.I)
@@ -288,30 +344,91 @@ def resolve_topic_from_history(raw_topic: str, history: list[HistoryEntry]) -> s
     return raw_topic
 
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
+# ── Prompt Refinement ──────────────────────────────────────────────────────────
+
+async def refine_prompt(message: str, history: list[HistoryEntry]) -> str:
+    """
+    Silently refine the user's message before passing it to the main AI:
+      1. Fix spelling/typos
+      2. Fix grammar
+      3. Resolve vague references using conversation history
+
+    The user never sees this — the frontend always displays their original message.
+    Returns the refined message string, falling back to the original on any error.
+    """
+    if not message or not message.strip():
+        return message
+
+    # Build compact history snippet (last 10 turns) for context
+    history_snippet = ""
+    if history:
+        trimmed = history[-10:]
+        lines = []
+        for entry in trimmed:
+            role_label = "Student" if entry.role == "user" else "Tutor"
+            content_preview = entry.content[:200] + ("..." if len(entry.content) > 200 else "")
+            lines.append(f"{role_label}: {content_preview}")
+        history_snippet = "\n".join(lines)
+
+    if history_snippet:
+        user_content = (
+            f"Conversation history so far:\n{history_snippet}\n\n"
+            f"New message to refine: {message}"
+        )
+    else:
+        user_content = f"Message to refine: {message}"
+
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": REFINE_SYSTEM_PROMPT},
+                {"role": "user",   "content": user_content},
+            ],
+            max_tokens=256,
+            temperature=0.2,
+        )
+        refined = response.choices[0].message.content.strip()
+
+        # Safety: if model returned something suspiciously long, fall back
+        if not refined or len(refined) > len(message) * 4:
+            logger.warning(f"refine_prompt: suspicious output, falling back. refined={refined[:80]!r}")
+            return message
+
+        logger.info(f"refine_prompt: '{message[:60]}' → '{refined[:60]}'")
+        return refined
+
+    except Exception as e:
+        logger.warning(f"refine_prompt: failed ({e}), using original message")
+        return message
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── ROUTES ────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/")
 async def root():
     return {
         "status": "Sedy API is live 🚀",
         "model": MODEL,
-        "version": "2.2.0",
-        "endpoints": ["/chat", "/flashcards", "/quiz", "/pdf-chat"],
+        "version": "2.3.0",
+        "endpoints": ["/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat"],
     }
 
+
+# ── /chat ──────────────────────────────────────────────────────────────────────
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     """
     Main chat endpoint.
-    Silently refines the user's message (spelling, grammar, context) before
-    sending to the model. The frontend always shows the original message.
+    Silently refines the user's message (spelling, grammar, context resolution)
+    before sending to the model. The frontend always shows the original message.
     """
     logger.info(f"/chat  history_len={len(req.history)}  msg={req.message[:80]!r}")
 
-    # ── Silent prompt refinement ───────────────────────────────────────────────
     refined_message = await refine_prompt(req.message, req.history)
-
     messages = build_messages(SYSTEM_PROMPT, req.history, refined_message)
 
     try:
@@ -330,13 +447,14 @@ async def chat(req: ChatRequest):
     return ChatResponse(reply=reply)
 
 
+# ── /flashcards ────────────────────────────────────────────────────────────────
+
 @app.post("/flashcards", response_model=FlashcardResponse)
 async def flashcards(req: FlashcardRequest):
     """
     Generate flashcards for a topic.
-    Refines the topic string silently before generation.
+    Refines the topic silently and resolves vague references from history.
     """
-    # ── Silent prompt refinement on the topic ──────────────────────────────────
     # Wrap in a natural sentence so the refiner has context to work with
     topic_as_prompt = f"Generate flashcards about {req.topic.strip()}"
     refined_prompt  = await refine_prompt(topic_as_prompt, req.history)
@@ -348,7 +466,7 @@ async def flashcards(req: FlashcardRequest):
     )
     topic = topic_match.group(1).strip() if topic_match else refined_prompt.strip()
 
-    # Also run the original vague-topic resolver as a safety net
+    # Run the vague-topic resolver as a safety net
     topic = resolve_topic_from_history(topic, req.history)
 
     if not topic:
@@ -397,24 +515,22 @@ async def flashcards(req: FlashcardRequest):
     return FlashcardResponse(cards=cards, topic=topic)
 
 
+# ── /quiz ──────────────────────────────────────────────────────────────────────
+
 @app.post("/quiz", response_model=QuizResponse)
 async def quiz(req: QuizRequest):
     """
     Generate a multiple-choice quiz for a topic.
-    Refines the topic string silently before generation.
+    Refines the topic silently and resolves vague references from history.
     """
-    # ── Silent prompt refinement on the topic ──────────────────────────────────
     topic_as_prompt = f"Quiz me on {req.topic.strip()}"
     refined_prompt  = await refine_prompt(topic_as_prompt, req.history)
 
-    # Extract topic back
     topic_match = re.search(
         r'(?:quiz\s+(?:me\s+)?(?:on|about)\s+|quiz\s+on\s+)(.+)',
         refined_prompt, re.I
     )
     topic = topic_match.group(1).strip() if topic_match else refined_prompt.strip()
-
-    # Also run the vague-topic resolver
     topic = resolve_topic_from_history(topic, req.history)
 
     if not topic:
@@ -478,58 +594,101 @@ async def quiz(req: QuizRequest):
     return QuizResponse(questions=questions, topic=topic, difficulty=difficulty)
 
 
-# ── PDF Chat ───────────────────────────────────────────────────────────────────
+# ── /graph ─────────────────────────────────────────────────────────────────────
 
-class PdfChatRequest(BaseModel):
-    message: str
-    pdf_base64: str
-    pdf_name: str = "document.pdf"
-    history: list[HistoryEntry] = []
+@app.post("/graph", response_model=GraphResponse)
+async def graph(req: GraphRequest):
+    """
+    Generate structured multi-series graph data from a natural language request.
+    Returns JSON suitable for the frontend canvas chart renderer.
+
+    Examples:
+      "show onion prices from 2000 to 2020"
+      "plot GDP of India vs China over the last 20 years"
+      "graph temperature trends in Delhi by month"
+    """
+    logger.info(f"/graph  msg={req.message[:80]!r}  history_len={len(req.history)}")
+
+    # Refine the message silently before generating data
+    refined = await refine_prompt(req.message, req.history)
+
+    messages = [
+        {"role": "system", "content": GRAPH_SYSTEM_PROMPT},
+        {"role": "user",   "content": refined},
+    ]
+
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            max_tokens=2500,
+            temperature=0.3,   # low temperature for consistent, structured data output
+        )
+    except Exception as e:
+        logger.error(f"Groq API error in /graph: {e}")
+        raise HTTPException(status_code=502, detail=f"Groq API error: {str(e)}")
+
+    raw = response.choices[0].message.content.strip()
+    raw = strip_json_fences(raw)
+
+    try:
+        obj = json.loads(raw)
+
+        series_list = []
+        for i, s in enumerate(obj.get("series", [])):
+            pts = []
+            for pt in s.get("data", []):
+                try:
+                    pts.append(GraphPoint(x=str(pt["x"]), y=float(pt["y"])))
+                except (KeyError, ValueError, TypeError):
+                    continue
+            if pts:
+                series_list.append(GraphSeries(
+                    label=str(s.get("label", f"Series {i+1}")),
+                    data=pts,
+                ))
+
+        if not series_list:
+            raise ValueError("No valid series found in model response")
+
+        result = GraphResponse(
+            title=str(obj.get("title", req.message[:60])),
+            unit=str(obj.get("unit", "")),
+            x_label=str(obj.get("x_label", "")),
+            caption=str(obj.get("caption", "")),
+            series=series_list,
+        )
+        logger.info(f"/graph  title={result.title!r}  series={len(result.series)}  points={sum(len(s.data) for s in result.series)}")
+        return result
+
+    except Exception as e:
+        logger.warning(f"/graph  JSON parse failed: {e}  raw={raw[:300]!r}")
+        raise HTTPException(status_code=422, detail=f"Could not parse graph data: {str(e)}")
 
 
-class PdfChatResponse(BaseModel):
-    reply: str
-    pdf_name: str
-
-
-PDF_SYSTEM_PROMPT = """You are Sedy, an intelligent student learning assistant made by Ansh Verma.
-The user has uploaded a PDF document. Your job is to help them understand it.
-
-You can:
-- Answer questions about the document's content
-- Summarize sections or the whole document
-- Explain concepts mentioned in the document
-- Generate study notes from the document
-- When asked for flashcards or a quiz, describe the key topics clearly so the frontend can generate them
-
-STRICT MATH FORMATTING RULES:
-- ALL mathematical expressions MUST use LaTeX delimiters: $...$ for inline, $$...$$ for display
-- NEVER write bare math like: w^2, dC/dw — always wrap in $...$
-- Use \\frac{}{} for fractions, _{} for subscripts
-
-Always be encouraging, clear, and educational.
-Only answer based on the document content. If something is not in the document, say so."""
-
+# ── /pdf-chat ──────────────────────────────────────────────────────────────────
 
 @app.post("/pdf-chat", response_model=PdfChatResponse)
 async def pdf_chat(req: PdfChatRequest):
     """
     Accept a base64-encoded PDF and a user question.
+    Extracts text from the PDF using pypdf, then sends content + question to the LLM.
     Silently refines the user's message before processing.
     """
     pdf_name = req.pdf_name.strip() or "document.pdf"
     logger.info(f"/pdf-chat  file={pdf_name!r}  msg={req.message[:80]!r}  history={len(req.history)}")
 
-    # ── Silent prompt refinement ───────────────────────────────────────────────
+    # Silent prompt refinement
     refined_message = await refine_prompt(req.message, req.history)
 
-    # ── Decode and extract text from PDF ──────────────────────────────────────
+    # Decode PDF
     try:
         pdf_bytes = base64.b64decode(req.pdf_base64)
     except Exception as e:
         logger.error(f"/pdf-chat  base64 decode failed: {e}")
         raise HTTPException(status_code=400, detail="Invalid base64 PDF data")
 
+    # Extract text
     pdf_text = ""
     try:
         from pypdf import PdfReader
@@ -547,23 +706,27 @@ async def pdf_chat(req: PdfChatRequest):
     if not pdf_text.strip():
         raise HTTPException(
             status_code=422,
-            detail="The PDF appears to be empty or contains only scanned images (no extractable text). "
-                   "Please try a text-based PDF."
+            detail=(
+                "The PDF appears to be empty or contains only scanned images "
+                "(no extractable text). Please try a text-based PDF."
+            )
         )
 
+    # Trim to fit context window (~60k chars is safe for llama-3.3-70b 128k context)
     MAX_PDF_CHARS = 60_000
     if len(pdf_text) > MAX_PDF_CHARS:
         pdf_text = pdf_text[:MAX_PDF_CHARS] + "\n\n[... document truncated to fit context ...]"
         logger.warning(f"/pdf-chat  PDF text truncated to {MAX_PDF_CHARS} chars")
 
     doc_context = (
-        f"The user has uploaded a PDF named \"{pdf_name}\".\n"
+        f'The user has uploaded a PDF named "{pdf_name}".\n'
         f"Here is the full text content of the document:\n"
         f"=== START OF DOCUMENT ===\n{pdf_text}\n=== END OF DOCUMENT ===\n"
     )
 
     messages = [{"role": "system", "content": PDF_SYSTEM_PROMPT + "\n\n" + doc_context}]
 
+    # Add conversation history (last 10 turns)
     trimmed = req.history[-10:] if len(req.history) > 10 else req.history
     sanitised: list[dict] = []
     for entry in trimmed:
@@ -574,7 +737,7 @@ async def pdf_chat(req: PdfChatRequest):
             sanitised.append({"role": role, "content": entry.content})
     messages.extend(sanitised)
 
-    # Use the refined message — user sees original on frontend
+    # Use refined message — user sees original on frontend
     messages.append({"role": "user", "content": refined_message})
 
     try:
