@@ -9,6 +9,7 @@ import base64
 import re
 import httpx
 
+
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 logger = logging.getLogger("sedy")
