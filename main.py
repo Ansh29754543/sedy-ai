@@ -8,14 +8,13 @@ import logging
 import base64
 import re
 import httpx
-import asyncio
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 logger = logging.getLogger("sedy")
 
 # ── App ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Sedy API", version="3.1.0")
+app = FastAPI(title="Sedy API", version="3.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Groq client ────────────────────────────────────────────────────────────────
@@ -28,10 +27,6 @@ client = Groq(api_key=GROQ_API_KEY)
 MODEL = "llama-3.3-70b-versatile"
 
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
-
-# ── Replicate API key ──────────────────────────────────────────────────────────
-# Replace the value below with your real token from replicate.com
-REPLICATE_API_TOKEN = "r8_efC0VnLHoQYX9Yd1q1A7hwTgQGIyX1f47OR8B"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -418,10 +413,10 @@ async def fetch_live_data(query: str) -> str:
 async def root():
     return {
         "status": "Sedy API is live 🚀",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "model": MODEL,
         "live_data": bool(SERPER_API_KEY),
-        "image_gen": bool(REPLICATE_API_TOKEN and not REPLICATE_API_TOKEN.endswith("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")),
+        "image_gen": "pollinations.ai (free)",
         "endpoints": ["/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat", "/intent", "/code-questions", "/generate-image"],
     }
 
@@ -730,67 +725,19 @@ async def code_questions(req: CodeQuestionsRequest):
 async def generate_image(req: ImageGenRequest):
     logger.info(f"/generate-image  prompt={req.prompt[:80]!r}")
 
-    if not REPLICATE_API_TOKEN or REPLICATE_API_TOKEN.endswith("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"):
-        raise HTTPException(status_code=500, detail="REPLICATE_API_TOKEN is not configured.")
-
-    # Refine the user's short prompt into a rich generation prompt
+    # Refine the user's short prompt into a rich generation prompt via Groq
     refined_prompt = await refine_image_prompt(req.prompt)
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as c:
-            # Step 1: create prediction
-            resp = await c.post(
-                "https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions",
-                headers={
-                    "Authorization": f"Bearer {REPLICATE_API_TOKEN}",
-                    "Content-Type": "application/json",
-                    "Prefer": "wait",
-                },
-                json={
-                    "input": {
-                        "prompt": refined_prompt,
-                        "num_outputs": 1,
-                        "aspect_ratio": "1:1",
-                        "output_format": "webp",
-                        "output_quality": 90,
-                    }
-                },
-            )
-            if resp.status_code not in (200, 201):
-                raise HTTPException(status_code=502, detail=f"Replicate rejected request: {resp.text[:200]}")
-
-            prediction = resp.json()
-
-            # If Prefer: wait returned a finished result immediately
-            if prediction.get("status") == "succeeded":
-                image_url = prediction["output"][0]
-                logger.info(f"/generate-image  url={image_url[:80]}")
-                return ImageGenResponse(image_url=image_url, prompt_used=refined_prompt)
-
-            prediction_id = prediction.get("id")
-            if not prediction_id:
-                raise HTTPException(status_code=502, detail="No prediction ID returned from Replicate.")
-
-            # Step 2: poll until done (max 30 attempts × 2s = 60s)
-            for _ in range(30):
-                await asyncio.sleep(2)
-                poll = await c.get(
-                    f"https://api.replicate.com/v1/predictions/{prediction_id}",
-                    headers={"Authorization": f"Bearer {REPLICATE_API_TOKEN}"},
-                )
-                result = poll.json()
-                status = result.get("status")
-                if status == "succeeded":
-                    image_url = result["output"][0]
-                    logger.info(f"/generate-image  url={image_url[:80]}")
-                    return ImageGenResponse(image_url=image_url, prompt_used=refined_prompt)
-                elif status == "failed":
-                    raise HTTPException(status_code=502, detail=f"Replicate generation failed: {result.get('error','unknown')}")
-
-            raise HTTPException(status_code=504, detail="Image generation timed out after 60 seconds.")
-
-    except HTTPException:
-        raise
+        # Pollinations AI — completely free, no API key, no credits needed
+        import urllib.parse
+        encoded = urllib.parse.quote(refined_prompt)
+        image_url = (
+            f"https://image.pollinations.ai/prompt/{encoded}"
+            f"?width=1024&height=1024&nologo=true&enhance=true&seed={hash(refined_prompt) % 99999}"
+        )
+        logger.info(f"/generate-image  url={image_url[:120]}")
+        return ImageGenResponse(image_url=image_url, prompt_used=refined_prompt)
     except Exception as e:
-        logger.error(f"Replicate error /generate-image: {e}")
+        logger.error(f"Image gen error: {e}")
         raise HTTPException(status_code=502, detail=f"Image generation failed: {e}")
