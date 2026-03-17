@@ -17,6 +17,10 @@ logger = logging.getLogger("sedy")
 app = FastAPI(title="Sedy API", version="3.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# Allow large responses for base64 images
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+
 # ── Groq client ────────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 if not GROQ_API_KEY:
@@ -729,15 +733,28 @@ async def generate_image(req: ImageGenRequest):
     refined_prompt = await refine_image_prompt(req.prompt)
 
     try:
-        # Pollinations AI — completely free, no API key, no credits needed
         import urllib.parse
         encoded = urllib.parse.quote(refined_prompt)
-        image_url = (
+        poll_url = (
             f"https://image.pollinations.ai/prompt/{encoded}"
-            f"?width=1024&height=1024&nologo=true&enhance=true&seed={hash(refined_prompt) % 99999}"
+            f"?width=1024&height=1024&nologo=true&enhance=true&seed={abs(hash(refined_prompt)) % 99999}"
         )
-        logger.info(f"/generate-image  url={image_url[:120]}")
-        return ImageGenResponse(image_url=image_url, prompt_used=refined_prompt)
+        logger.info(f"/generate-image  fetching={poll_url[:120]}")
+
+        # Fetch image server-side to avoid CORS issues, then return as base64
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as c:
+            resp = await c.get(poll_url, headers={"User-Agent": "SedyBot/1.0"})
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Pollinations returned {resp.status_code}")
+            content_type = resp.headers.get("content-type", "image/jpeg")
+            img_b64 = base64.b64encode(resp.content).decode("utf-8")
+            data_url = f"data:{content_type};base64,{img_b64}"
+
+        logger.info(f"/generate-image  done  size={len(resp.content)//1024}KB")
+        return ImageGenResponse(image_url=data_url, prompt_used=refined_prompt)
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Image gen error: {e}")
         raise HTTPException(status_code=502, detail=f"Image generation failed: {e}")
