@@ -8,13 +8,14 @@ import logging
 import base64
 import re
 import httpx
+import replicate
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 logger = logging.getLogger("sedy")
 
 # ── App ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Sedy API", version="3.0.0")
+app = FastAPI(title="Sedy API", version="3.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Groq client ────────────────────────────────────────────────────────────────
@@ -26,7 +27,11 @@ client = Groq(api_key=GROQ_API_KEY)
 
 MODEL = "llama-3.3-70b-versatile"
 
-SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
+SERPER_API_KEY = "f968d3ac4fea0ec018f949ec1f3ca1ed9218559e"
+
+# ── Replicate API key ──────────────────────────────────────────────────────────
+REPLICATE_API_TOKEN = "r8_0ALmg7cHe0sdZUnygSRUfaaYcEbI2283enWDK"
+os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -104,12 +109,13 @@ Only answer based on document content."""
 # ──────────────────────────────────────────────────────────────────────────────
 
 INTENT_SYSTEM_PROMPT = """You are an intent classifier for a student learning app.
-Output EXACTLY one word from: graph, flashcard, quiz, both, chat
+Output EXACTLY one word from: graph, flashcard, quiz, both, chat, image
 
 graph     = wants a chart/graph/visualisation
 flashcard = wants flip study cards
 quiz      = wants MCQ quiz
 both      = wants flashcards AND a quiz
+image     = wants an AI-generated image/picture/illustration/artwork
 chat      = everything else
 
 No punctuation, no explanation. One word only."""
@@ -135,6 +141,13 @@ FORMAT:
   {{"question": "Question text?", "options": ["Option A", "Option B", "Option C"]}},
   {{"question": "Another question?", "options": ["Option A", "Option B", "Option C", "Option D"]}}
 ]"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+IMAGE_PROMPT_REFINE_SYSTEM = """You are a prompt engineer for AI image generation.
+The user has requested an image. Extract and expand their request into a clean,
+detailed image generation prompt (max 120 words). Be descriptive about style,
+lighting, composition, and mood. Output ONLY the refined prompt, nothing else."""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -170,6 +183,9 @@ class PdfChatRequest(BaseModel):
     pdf_base64: str
     pdf_name: str = "document.pdf"
     history: list[HistoryEntry] = []
+
+class ImageGenRequest(BaseModel):
+    prompt: str
 
 class ChatResponse(BaseModel):
     reply: str
@@ -230,6 +246,10 @@ class CodeQuestion(BaseModel):
 
 class CodeQuestionsResponse(BaseModel):
     questions: list[CodeQuestion]
+
+class ImageGenResponse(BaseModel):
+    image_url: str
+    prompt_used: str
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -345,6 +365,28 @@ async def refine_graph_prompt(message: str, history: list[HistoryEntry]) -> str:
     return await refine_prompt(message, history, system_prompt=GRAPH_REFINE_SYSTEM_PROMPT)
 
 
+async def refine_image_prompt(raw_prompt: str) -> str:
+    """Expand a short user image request into a rich generation prompt."""
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": IMAGE_PROMPT_REFINE_SYSTEM},
+                {"role": "user",   "content": raw_prompt},
+            ],
+            max_tokens=180,
+            temperature=0.7,
+        )
+        refined = response.choices[0].message.content.strip()
+        if not refined:
+            return raw_prompt
+        logger.info(f"image prompt refined: '{raw_prompt[:50]}' → '{refined[:60]}'")
+        return refined
+    except Exception as e:
+        logger.warning(f"refine_image_prompt failed ({e}), using original")
+        return raw_prompt
+
+
 async def fetch_live_data(query: str) -> str:
     if not SERPER_API_KEY:
         return ""
@@ -376,10 +418,11 @@ async def fetch_live_data(query: str) -> str:
 async def root():
     return {
         "status": "Sedy API is live 🚀",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "model": MODEL,
         "live_data": bool(SERPER_API_KEY),
-        "endpoints": ["/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat", "/intent", "/code-questions"],
+        "image_gen": bool(REPLICATE_API_TOKEN and not REPLICATE_API_TOKEN.endswith("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")),
+        "endpoints": ["/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat", "/intent", "/code-questions", "/generate-image"],
     }
 
 
@@ -403,7 +446,7 @@ async def detect_intent(req: IntentRequest):
             max_tokens=5, temperature=0.0,
         )
         raw = response.choices[0].message.content.strip().lower()
-        intent = raw if raw in ("graph", "flashcard", "quiz", "both", "chat") else "chat"
+        intent = raw if raw in ("graph", "flashcard", "quiz", "both", "image", "chat") else "chat"
         logger.info(f"/intent  result={intent!r}")
         return IntentResponse(intent=intent)
     except Exception as e:
@@ -645,12 +688,6 @@ async def pdf_chat(req: PdfChatRequest):
 
 @app.post("/code-questions", response_model=CodeQuestionsResponse)
 async def code_questions(req: CodeQuestionsRequest):
-    """
-    Given a coding request, returns 2-3 smart MCQ questions to clarify
-    what the user wants before writing the code. Skips anything already
-    mentioned (e.g. language, framework).
-    Returns empty list if request is already detailed enough.
-    """
     logger.info(f"/code-questions  msg={req.message[:80]!r}")
     prompt = CODE_QUESTIONS_PROMPT.format(request=req.message.strip())
     try:
@@ -666,7 +703,6 @@ async def code_questions(req: CodeQuestionsRequest):
     except Exception as e:
         logger.error(f"Groq error /code-questions: {e}")
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
-
     raw = response.choices[0].message.content.strip()
     clean = raw.replace("```json", "").replace("```", "").strip()
     try:
@@ -686,3 +722,35 @@ async def code_questions(req: CodeQuestionsRequest):
     except Exception as e:
         logger.warning(f"/code-questions  parse failed: {e}  raw={raw[:200]!r}")
         return CodeQuestionsResponse(questions=[])
+
+
+# ── /generate-image ────────────────────────────────────────────────────────────
+
+@app.post("/generate-image", response_model=ImageGenResponse)
+async def generate_image(req: ImageGenRequest):
+    logger.info(f"/generate-image  prompt={req.prompt[:80]!r}")
+
+    if not REPLICATE_API_TOKEN or REPLICATE_API_TOKEN.endswith("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"):
+        raise HTTPException(status_code=500, detail="REPLICATE_API_TOKEN is not configured.")
+
+    # Refine the user's short prompt into a rich generation prompt
+    refined_prompt = await refine_image_prompt(req.prompt)
+
+    try:
+        output = replicate.run(
+            "black-forest-labs/flux-schnell",
+            input={
+                "prompt": refined_prompt,
+                "num_outputs": 1,
+                "aspect_ratio": "1:1",
+                "output_format": "webp",
+                "output_quality": 90,
+            }
+        )
+        # output is a list of URLs
+        image_url = str(output[0]) if isinstance(output, list) else str(output)
+        logger.info(f"/generate-image  url={image_url[:80]}")
+        return ImageGenResponse(image_url=image_url, prompt_used=refined_prompt)
+    except Exception as e:
+        logger.error(f"Replicate error /generate-image: {e}")
+        raise HTTPException(status_code=502, detail=f"Image generation failed: {e}")
