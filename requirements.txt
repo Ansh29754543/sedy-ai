@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 groq
-replicate
+replicate==1.0.4
 pypdf
 httpx
 pydantic
