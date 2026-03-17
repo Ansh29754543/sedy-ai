@@ -1,7 +1,8 @@
 fastapi
 uvicorn
 groq
-pydantic
+replicate
 pypdf
 httpx
+pydantic
 python-multipart
