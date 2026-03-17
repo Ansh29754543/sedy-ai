@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(me
 logger = logging.getLogger("sedy")
 
 # ── App ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Sedy API", version="3.2.0")
+app = FastAPI(title="Sedy API", version="3.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # Allow large responses for base64 images
@@ -417,10 +417,10 @@ async def fetch_live_data(query: str) -> str:
 async def root():
     return {
         "status": "Sedy API is live 🚀",
-        "version": "3.2.0",
+        "version": "3.3.0",
         "model": MODEL,
         "live_data": bool(SERPER_API_KEY),
-        "image_gen": "pollinations.ai (free)",
+        "image_gen": "huggingface FLUX.1-schnell (free)",
         "endpoints": ["/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat", "/intent", "/code-questions", "/generate-image"],
     }
 
@@ -725,62 +725,72 @@ async def code_questions(req: CodeQuestionsRequest):
 
 # ── /generate-image ────────────────────────────────────────────────────────────
 
+# Get your free token at huggingface.co → Settings → Access Tokens
+HF_TOKEN = "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"
+
+# Model to use — FLUX.1-schnell is fast and free
+HF_MODEL_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+
 @app.post("/generate-image", response_model=ImageGenResponse)
 async def generate_image(req: ImageGenRequest):
-    import urllib.parse, random, asyncio
+    import asyncio
 
     logger.info(f"/generate-image  prompt={req.prompt[:80]!r}")
 
+    if not HF_TOKEN or HF_TOKEN == "hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx":
+        raise HTTPException(status_code=500, detail="HF_TOKEN is not configured. Get a free token at huggingface.co.")
+
     # Refine the user's short prompt into a rich generation prompt via Groq
     refined_prompt = await refine_image_prompt(req.prompt)
-    encoded = urllib.parse.quote(refined_prompt)
-    seed = random.randint(1, 999999)
-
-    poll_url = (
-        f"https://image.pollinations.ai/prompt/{encoded}"
-        f"?width=1024&height=1024&nologo=true&enhance=true&seed={seed}"
-    )
-    logger.info(f"/generate-image  url={poll_url[:140]}")
+    logger.info(f"/generate-image  refined={refined_prompt[:80]!r}")
 
     last_error = ""
-    # Retry up to 3 times — Pollinations occasionally times out on first try
-    for attempt in range(3):
+    for attempt in range(4):
         try:
-            async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as c:
-                resp = await c.get(
-                    poll_url,
+            async with httpx.AsyncClient(timeout=120.0) as c:
+                resp = await c.post(
+                    HF_MODEL_URL,
                     headers={
-                        "User-Agent": "Mozilla/5.0 (compatible; SedyBot/1.0)",
-                        "Accept": "image/webp,image/jpeg,image/*",
-                    }
+                        "Authorization": f"Bearer {HF_TOKEN}",
+                        "Accept": "image/jpeg",
+                        "x-use-cache": "false",
+                    },
+                    json={"inputs": refined_prompt},
                 )
                 logger.info(f"/generate-image  attempt={attempt+1}  status={resp.status_code}  content-type={resp.headers.get('content-type','?')}")
 
+                # Model is loading — wait and retry
+                if resp.status_code == 503:
+                    wait = resp.json().get("estimated_time", 20)
+                    logger.info(f"/generate-image  model loading, waiting {wait}s...")
+                    await asyncio.sleep(min(float(wait), 25))
+                    continue
+
                 if resp.status_code == 200:
                     content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
-                    # Make sure we actually got an image and not an error HTML page
                     if not content_type.startswith("image/"):
-                        last_error = f"Pollinations returned non-image content: {content_type}"
-                        logger.warning(f"/generate-image  {last_error}  body={resp.text[:200]}")
-                        await asyncio.sleep(3)
+                        last_error = f"HuggingFace returned non-image: {content_type} — {resp.text[:150]}"
+                        logger.warning(f"/generate-image  {last_error}")
+                        await asyncio.sleep(5)
                         continue
 
                     img_b64 = base64.b64encode(resp.content).decode("utf-8")
                     data_url = f"data:{content_type};base64,{img_b64}"
                     logger.info(f"/generate-image  success  size={len(resp.content)//1024}KB")
                     return ImageGenResponse(image_url=data_url, prompt_used=refined_prompt)
-                else:
-                    last_error = f"Pollinations returned HTTP {resp.status_code}: {resp.text[:200]}"
-                    logger.warning(f"/generate-image  {last_error}")
-                    await asyncio.sleep(4)
+
+                # Any other error
+                last_error = f"HuggingFace HTTP {resp.status_code}: {resp.text[:200]}"
+                logger.warning(f"/generate-image  {last_error}")
+                await asyncio.sleep(5)
 
         except httpx.TimeoutException:
             last_error = f"Request timed out on attempt {attempt+1}"
             logger.warning(f"/generate-image  {last_error}")
-            await asyncio.sleep(3)
+            await asyncio.sleep(5)
         except Exception as e:
             last_error = str(e)
             logger.error(f"/generate-image  attempt={attempt+1}  error={e}")
             await asyncio.sleep(3)
 
-    raise HTTPException(status_code=502, detail=f"Image generation failed after 3 attempts: {last_error}")
+    raise HTTPException(status_code=502, detail=f"Image generation failed: {last_error}")
