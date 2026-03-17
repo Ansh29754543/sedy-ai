@@ -727,34 +727,60 @@ async def code_questions(req: CodeQuestionsRequest):
 
 @app.post("/generate-image", response_model=ImageGenResponse)
 async def generate_image(req: ImageGenRequest):
+    import urllib.parse, random, asyncio
+
     logger.info(f"/generate-image  prompt={req.prompt[:80]!r}")
 
     # Refine the user's short prompt into a rich generation prompt via Groq
     refined_prompt = await refine_image_prompt(req.prompt)
+    encoded = urllib.parse.quote(refined_prompt)
+    seed = random.randint(1, 999999)
 
-    try:
-        import urllib.parse
-        encoded = urllib.parse.quote(refined_prompt)
-        poll_url = (
-            f"https://image.pollinations.ai/prompt/{encoded}"
-            f"?width=1024&height=1024&nologo=true&enhance=true&seed={abs(hash(refined_prompt)) % 99999}"
-        )
-        logger.info(f"/generate-image  fetching={poll_url[:120]}")
+    poll_url = (
+        f"https://image.pollinations.ai/prompt/{encoded}"
+        f"?width=1024&height=1024&nologo=true&enhance=true&seed={seed}"
+    )
+    logger.info(f"/generate-image  url={poll_url[:140]}")
 
-        # Fetch image server-side to avoid CORS issues, then return as base64
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as c:
-            resp = await c.get(poll_url, headers={"User-Agent": "SedyBot/1.0"})
-            if resp.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"Pollinations returned {resp.status_code}")
-            content_type = resp.headers.get("content-type", "image/jpeg")
-            img_b64 = base64.b64encode(resp.content).decode("utf-8")
-            data_url = f"data:{content_type};base64,{img_b64}"
+    last_error = ""
+    # Retry up to 3 times — Pollinations occasionally times out on first try
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as c:
+                resp = await c.get(
+                    poll_url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; SedyBot/1.0)",
+                        "Accept": "image/webp,image/jpeg,image/*",
+                    }
+                )
+                logger.info(f"/generate-image  attempt={attempt+1}  status={resp.status_code}  content-type={resp.headers.get('content-type','?')}")
 
-        logger.info(f"/generate-image  done  size={len(resp.content)//1024}KB")
-        return ImageGenResponse(image_url=data_url, prompt_used=refined_prompt)
+                if resp.status_code == 200:
+                    content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+                    # Make sure we actually got an image and not an error HTML page
+                    if not content_type.startswith("image/"):
+                        last_error = f"Pollinations returned non-image content: {content_type}"
+                        logger.warning(f"/generate-image  {last_error}  body={resp.text[:200]}")
+                        await asyncio.sleep(3)
+                        continue
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Image gen error: {e}")
-        raise HTTPException(status_code=502, detail=f"Image generation failed: {e}")
+                    img_b64 = base64.b64encode(resp.content).decode("utf-8")
+                    data_url = f"data:{content_type};base64,{img_b64}"
+                    logger.info(f"/generate-image  success  size={len(resp.content)//1024}KB")
+                    return ImageGenResponse(image_url=data_url, prompt_used=refined_prompt)
+                else:
+                    last_error = f"Pollinations returned HTTP {resp.status_code}: {resp.text[:200]}"
+                    logger.warning(f"/generate-image  {last_error}")
+                    await asyncio.sleep(4)
+
+        except httpx.TimeoutException:
+            last_error = f"Request timed out on attempt {attempt+1}"
+            logger.warning(f"/generate-image  {last_error}")
+            await asyncio.sleep(3)
+        except Exception as e:
+            last_error = str(e)
+            logger.error(f"/generate-image  attempt={attempt+1}  error={e}")
+            await asyncio.sleep(3)
+
+    raise HTTPException(status_code=502, detail=f"Image generation failed after 3 attempts: {last_error}")
