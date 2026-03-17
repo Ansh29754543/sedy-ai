@@ -24,8 +24,7 @@ if not GROQ_API_KEY:
 
 client = Groq(api_key=GROQ_API_KEY)
 
-MODEL        = "llama-3.3-70b-versatile"
-MODEL_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"
+MODEL = "llama-3.3-70b-versatile"
 
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 
@@ -41,7 +40,7 @@ Always be encouraging, clear and educational.
 Only reveal your identity when asked.
 
 IMPORTANT RULES:
-- Use markdown formatting: headers (##), bold (**text**), bullet points (- item), code blocks
+- Use markdown formatting: headers (##), bold (**text**), bullet points (- item), code blocks (```language)
 - NEVER describe flashcards or quizzes in plain text — the frontend handles those separately
 - Keep responses focused and well structured
 - Use conversation history for context when user refers to "it", "that", "same topic"
@@ -49,14 +48,7 @@ IMPORTANT RULES:
 STRICT MATH FORMATTING (frontend uses KaTeX):
 - ALL math MUST be wrapped in LaTeX: $...$ inline, $$...$$ display
 - NEVER write bare math like w^2 — always wrap in $w^2$
-- Fractions: $\\frac{a}{b}$  Subscripts: $A_{\\text{base}}$
-
-FOLLOW-UP SUGGESTIONS — REQUIRED FOR EVERY RESPONSE:
-After your reply, on a new line output EXACTLY:
-SUGGESTIONS: <suggestion 1> | <suggestion 2> | <suggestion 3>
-- Each suggestion: 4-8 words, a natural follow-up question
-- Example: SUGGESTIONS: How does mitosis differ from meiosis? | What triggers cell division? | Quiz me on this topic
-- The frontend strips this line — users never see the raw format"""
+- Fractions: $\\frac{a}{b}$  Subscripts: $A_{\\text{base}}$"""
 
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -111,26 +103,6 @@ Only answer based on document content."""
 
 # ──────────────────────────────────────────────────────────────────────────────
 
-IMAGE_SYSTEM_PROMPT = """You are Sedy, an intelligent student learning assistant made by Ansh Verma.
-The user has uploaded an image — a textbook page, handwritten notes, diagram, or math problem.
-
-Your job:
-1. Carefully read everything visible in the image
-2. If the user asks a specific question, answer it
-3. If no question, provide helpful analysis:
-   - Math problems → solve step by step
-   - Diagrams → explain what they show
-   - Notes/text → summarize key points
-   - Handwritten work → read and explain
-
-Use markdown formatting. Use LaTeX for math: $...$ inline, $$...$$ display.
-
-FOLLOW-UP SUGGESTIONS — REQUIRED:
-After your reply output EXACTLY:
-SUGGESTIONS: <suggestion 1> | <suggestion 2> | <suggestion 3>"""
-
-# ──────────────────────────────────────────────────────────────────────────────
-
 INTENT_SYSTEM_PROMPT = """You are an intent classifier for a student learning app.
 Output EXACTLY one word from: graph, flashcard, quiz, both, chat
 
@@ -141,6 +113,28 @@ both      = wants flashcards AND a quiz
 chat      = everything else
 
 No punctuation, no explanation. One word only."""
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+CODE_QUESTIONS_PROMPT = """You are helping clarify a coding request before writing code.
+The user has asked: "{request}"
+
+Generate 2-3 SHORT, RELEVANT multiple-choice questions to clarify missing details.
+
+STRICT RULES:
+- NEVER ask about something the user already mentioned (e.g. if they said "Python", never ask language)
+- NEVER ask generic or obvious questions
+- Ask only about things that will genuinely change how the code is written
+- Good topics: complexity level, extra features, UI style, error handling, data storage
+- Each question must have 3-4 short options (1-5 words each)
+- If the request is already very detailed and nothing is missing, return an empty array []
+- Return ONLY a valid JSON array, no markdown fences, no explanation
+
+FORMAT:
+[
+  {{"question": "Question text?", "options": ["Option A", "Option B", "Option C"]}},
+  {{"question": "Another question?", "options": ["Option A", "Option B", "Option C", "Option D"]}}
+]"""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -177,14 +171,8 @@ class PdfChatRequest(BaseModel):
     pdf_name: str = "document.pdf"
     history: list[HistoryEntry] = []
 
-class ImageChatRequest(BaseModel):
-    message: str
-    image_base64: str
-    image_type: str = "image/jpeg"
-
 class ChatResponse(BaseModel):
     reply: str
-    suggestions: list[str] = []
 
 class Flashcard(BaseModel):
     question: str
@@ -226,16 +214,22 @@ class PdfChatResponse(BaseModel):
     reply: str
     pdf_name: str
 
-class ImageChatResponse(BaseModel):
-    reply: str
-    suggestions: list[str] = []
-
 class IntentRequest(BaseModel):
     message: str
     history: list[HistoryEntry] = []
 
 class IntentResponse(BaseModel):
     intent: str
+
+class CodeQuestionsRequest(BaseModel):
+    message: str
+
+class CodeQuestion(BaseModel):
+    question: str
+    options: list[str]
+
+class CodeQuestionsResponse(BaseModel):
+    questions: list[CodeQuestion]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -279,19 +273,6 @@ def strip_json_fences(raw: str) -> str:
             raw = raw[4:]
         raw = raw.rsplit("```", 1)[0].strip()
     return raw
-
-
-def parse_suggestions(reply: str) -> tuple[str, list[str]]:
-    """Extract SUGGESTIONS: a | b | c from reply, return (clean_reply, [a, b, c])"""
-    suggestions = []
-    clean_lines = []
-    for line in reply.strip().split('\n'):
-        if line.strip().startswith("SUGGESTIONS:"):
-            raw = line.strip()[len("SUGGESTIONS:"):].strip()
-            suggestions = [s.strip() for s in raw.split('|') if s.strip()][:3]
-        else:
-            clean_lines.append(line)
-    return '\n'.join(clean_lines).strip(), suggestions
 
 
 VAGUE_TOPIC_SIGNALS = [
@@ -353,6 +334,7 @@ async def refine_prompt(message: str, history: list[HistoryEntry],
         refined = response.choices[0].message.content.strip()
         if not refined or len(refined) > len(message) * 5:
             return message
+        logger.info(f"refine: '{message[:50]}' → '{refined[:50]}'")
         return refined
     except Exception as e:
         logger.warning(f"refine_prompt failed ({e}), using original")
@@ -377,8 +359,9 @@ async def fetch_live_data(query: str) -> str:
                 return ""
             snippets = []
             for r in resp.json().get("organic", [])[:5]:
-                t, s = r.get("title",""), r.get("snippet","")
-                if t or s: snippets.append(f"• {t}: {s}")
+                t, s = r.get("title", ""), r.get("snippet", "")
+                if t or s:
+                    snippets.append(f"• {t}: {s}")
             return "\n".join(snippets)
     except Exception as e:
         logger.warning(f"live_data failed: {e}")
@@ -395,9 +378,8 @@ async def root():
         "status": "Sedy API is live 🚀",
         "version": "3.0.0",
         "model": MODEL,
-        "model_vision": MODEL_VISION,
-        "features": ["voice_input", "text_to_speech", "follow_up_suggestions", "image_upload"],
-        "endpoints": ["/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat", "/image-chat", "/intent"],
+        "live_data": bool(SERPER_API_KEY),
+        "endpoints": ["/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat", "/intent", "/code-questions"],
     }
 
 
@@ -443,53 +425,9 @@ async def chat(req: ChatRequest):
     except Exception as e:
         logger.error(f"Groq error /chat: {e}")
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
-    raw_reply = response.choices[0].message.content.strip()
-    reply, suggestions = parse_suggestions(raw_reply)
-    logger.info(f"/chat  reply_len={len(reply)}  suggestions={len(suggestions)}")
-    return ChatResponse(reply=reply, suggestions=suggestions)
-
-
-# ── /image-chat ────────────────────────────────────────────────────────────────
-
-@app.post("/image-chat", response_model=ImageChatResponse)
-async def image_chat(req: ImageChatRequest):
-    """Vision endpoint — analyses images using Groq's llama-4-scout vision model."""
-    logger.info(f"/image-chat  type={req.image_type}  msg={req.message[:80]!r}")
-
-    allowed = {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"}
-    img_type = req.image_type.lower()
-    if img_type not in allowed:
-        raise HTTPException(status_code=400, detail=f"Unsupported image type: {img_type}")
-
-    user_message_content = [
-        {
-            "type": "image_url",
-            "image_url": {"url": f"data:{img_type};base64,{req.image_base64}"}
-        },
-        {
-            "type": "text",
-            "text": req.message.strip() or "Please analyse this image and help me understand it."
-        }
-    ]
-
-    try:
-        response = client.chat.completions.create(
-            model=MODEL_VISION,
-            messages=[
-                {"role": "system", "content": IMAGE_SYSTEM_PROMPT},
-                {"role": "user",   "content": user_message_content},
-            ],
-            max_tokens=1024,
-            temperature=0.7,
-        )
-    except Exception as e:
-        logger.error(f"Groq error /image-chat: {e}")
-        raise HTTPException(status_code=502, detail=f"Groq vision API error: {e}")
-
-    raw_reply = response.choices[0].message.content.strip()
-    reply, suggestions = parse_suggestions(raw_reply)
-    logger.info(f"/image-chat  reply_len={len(reply)}  suggestions={len(suggestions)}")
-    return ImageChatResponse(reply=reply, suggestions=suggestions)
+    reply = response.choices[0].message.content.strip()
+    logger.info(f"/chat  reply_len={len(reply)}")
+    return ChatResponse(reply=reply)
 
 
 # ── /flashcards ────────────────────────────────────────────────────────────────
@@ -507,7 +445,7 @@ async def flashcards(req: FlashcardRequest):
     count = max(1, min(req.count, 20))
     user_prompt = (
         f'Generate exactly {count} flashcards about "{topic}".\n'
-        f'Return ONLY a JSON array:\n[{{"question":"...","answer":"..."}}]'
+        f'Return ONLY a JSON array, no markdown:\n[{{"question":"...","answer":"..."}}]'
     )
     try:
         response = client.chat.completions.create(
@@ -516,14 +454,22 @@ async def flashcards(req: FlashcardRequest):
             max_tokens=1500, temperature=0.7,
         )
     except Exception as e:
+        logger.error(f"Groq error /flashcards: {e}")
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
     raw = response.choices[0].message.content.strip()
     try:
         data = extract_json_array(raw)
-        cards = [Flashcard(question=str(c.get("question") or c.get("front","")), answer=str(c.get("answer") or c.get("back",""))) for c in data if isinstance(c, dict)]
+        cards = [
+            Flashcard(
+                question=str(c.get("question") or c.get("front", "")),
+                answer=str(c.get("answer") or c.get("back", "")),
+            )
+            for c in data if isinstance(c, dict)
+        ]
         cards = [c for c in cards if c.question and c.answer]
     except Exception:
         cards = [Flashcard(question=f"What is {topic}?", answer=raw[:300])]
+    logger.info(f"/flashcards  generated {len(cards)} cards")
     return FlashcardResponse(cards=cards, topic=topic)
 
 
@@ -543,7 +489,8 @@ async def quiz(req: QuizRequest):
     count = max(1, min(req.count, 20))
     user_prompt = (
         f'Generate exactly {count} {difficulty} MCQs about "{topic}".\n'
-        f'Return ONLY JSON array:\n[{{"question":"...","options":["A","B","C","D"],"answer":0,"explanation":"..."}}]'
+        f'Return ONLY JSON array, no markdown:\n'
+        f'[{{"question":"...","options":["A","B","C","D"],"answer":0,"explanation":"..."}}]'
     )
     try:
         response = client.chat.completions.create(
@@ -552,23 +499,33 @@ async def quiz(req: QuizRequest):
             max_tokens=2000, temperature=0.7,
         )
     except Exception as e:
+        logger.error(f"Groq error /quiz: {e}")
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
     raw = response.choices[0].message.content.strip()
     try:
         data = extract_json_array(raw)
         questions = []
         for q in data:
-            if not isinstance(q, dict): continue
+            if not isinstance(q, dict):
+                continue
             opts = q.get("options", [])
-            while len(opts) < 4: opts.append("N/A")
+            while len(opts) < 4:
+                opts.append("N/A")
             questions.append(QuizQuestion(
-                question=str(q.get("question","")), options=opts[:4],
-                answer=max(0, min(int(q.get("answer",0)), 3)),
-                explanation=str(q.get("explanation","")),
+                question=str(q.get("question", "")),
+                options=opts[:4],
+                answer=max(0, min(int(q.get("answer", 0)), 3)),
+                explanation=str(q.get("explanation", "")),
             ))
         questions = [q for q in questions if q.question]
     except Exception:
-        questions = [QuizQuestion(question=f"Key concept in {topic}?", options=["A","B","C","D"], answer=0, explanation=raw[:300])]
+        questions = [QuizQuestion(
+            question=f"Key concept in {topic}?",
+            options=["Option A", "Option B", "Option C", "Option D"],
+            answer=0,
+            explanation=raw[:300],
+        )]
+    logger.info(f"/quiz  generated {len(questions)} questions")
     return QuizResponse(questions=questions, topic=topic, difficulty=difficulty)
 
 
@@ -578,13 +535,15 @@ async def quiz(req: QuizRequest):
 async def graph(req: GraphRequest):
     logger.info(f"/graph  msg={req.message[:80]!r}")
     refined = await refine_graph_prompt(req.message, req.history)
+    logger.info(f"/graph  refined='{refined[:80]}'")
     live_snippets = ""
     data_source = "estimated"
     if SERPER_API_KEY:
         live_snippets = await fetch_live_data(refined + " data statistics numbers")
-        if live_snippets: data_source = "live"
+        if live_snippets:
+            data_source = "live"
     user_content = (
-        f"User request: {refined}\n\nReal-time data:\n{live_snippets}\n\nGenerate chart JSON."
+        f"User request: {refined}\n\nReal-time data (use where possible):\n{live_snippets}\n\nGenerate chart JSON."
         if live_snippets else refined
     )
     try:
@@ -594,6 +553,7 @@ async def graph(req: GraphRequest):
             max_tokens=2500, temperature=0.3,
         )
     except Exception as e:
+        logger.error(f"Groq error /graph: {e}")
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
     raw = strip_json_fences(response.choices[0].message.content.strip())
     try:
@@ -602,18 +562,30 @@ async def graph(req: GraphRequest):
         for i, s in enumerate(obj.get("series", [])):
             pts = []
             for pt in s.get("data", []):
-                try: pts.append(GraphPoint(x=str(pt["x"]), y=float(pt["y"])))
-                except: continue
-            if pts: series_list.append(GraphSeries(label=str(s.get("label", f"Series {i+1}")), data=pts))
-        if not series_list: raise ValueError("No valid series")
-        ct = str(obj.get("chart_type","line")).lower().strip()
-        if ct not in ("line","bar","pie"): ct = "line"
-        return GraphResponse(
-            title=str(obj.get("title", refined[:60])), chart_type=ct,
-            unit=str(obj.get("unit","")), x_label=str(obj.get("x_label","")),
-            caption=str(obj.get("caption","")), data_source=data_source, series=series_list,
+                try:
+                    pts.append(GraphPoint(x=str(pt["x"]), y=float(pt["y"])))
+                except (KeyError, ValueError, TypeError):
+                    continue
+            if pts:
+                series_list.append(GraphSeries(label=str(s.get("label", f"Series {i+1}")), data=pts))
+        if not series_list:
+            raise ValueError("No valid series found")
+        ct = str(obj.get("chart_type", "line")).lower().strip()
+        if ct not in ("line", "bar", "pie"):
+            ct = "line"
+        result = GraphResponse(
+            title=str(obj.get("title", refined[:60])),
+            chart_type=ct,
+            unit=str(obj.get("unit", "")),
+            x_label=str(obj.get("x_label", "")),
+            caption=str(obj.get("caption", "")),
+            data_source=data_source,
+            series=series_list,
         )
+        logger.info(f"/graph  title={result.title!r}  type={ct}  series={len(series_list)}")
+        return result
     except Exception as e:
+        logger.warning(f"/graph  parse failed: {e}  raw={raw[:300]!r}")
         raise HTTPException(status_code=422, detail=f"Could not parse graph data: {e}")
 
 
@@ -635,17 +607,22 @@ async def pdf_chat(req: PdfChatRequest):
         reader = PdfReader(io.BytesIO(pdf_bytes))
         for i, page in enumerate(reader.pages):
             pdf_text += f"\n--- Page {i+1} ---\n{page.extract_text() or ''}"
+        logger.info(f"/pdf-chat  {len(pdf_text)} chars from {len(reader.pages)} pages")
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Could not read PDF: {e}")
     if not pdf_text.strip():
-        raise HTTPException(status_code=422, detail="PDF appears empty or image-only.")
-    if len(pdf_text) > 60_000:
-        pdf_text = pdf_text[:60_000] + "\n\n[... truncated ...]"
-    doc_context = f'PDF: "{pdf_name}"\n=== DOCUMENT ===\n{pdf_text}\n=== END ==='
+        raise HTTPException(status_code=422, detail="PDF appears empty or image-only. Please try a text-based PDF.")
+    MAX_PDF_CHARS = 60_000
+    if len(pdf_text) > MAX_PDF_CHARS:
+        pdf_text = pdf_text[:MAX_PDF_CHARS] + "\n\n[... document truncated to fit context ...]"
+    doc_context = (
+        f'The user has uploaded a PDF named "{pdf_name}".\n'
+        f"=== DOCUMENT START ===\n{pdf_text}\n=== DOCUMENT END ==="
+    )
     messages = [{"role": "system", "content": PDF_SYSTEM_PROMPT + "\n\n" + doc_context}]
     sanitised: list[dict] = []
     for entry in req.history[-10:]:
-        role = entry.role if entry.role in ("user","assistant") else "user"
+        role = entry.role if entry.role in ("user", "assistant") else "user"
         if sanitised and sanitised[-1]["role"] == role:
             sanitised[-1]["content"] += "\n" + entry.content
         else:
@@ -657,48 +634,23 @@ async def pdf_chat(req: PdfChatRequest):
             model=MODEL, messages=messages, max_tokens=1500, temperature=0.7,
         )
     except Exception as e:
+        logger.error(f"Groq error /pdf-chat: {e}")
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
-    return PdfChatResponse(reply=response.choices[0].message.content.strip(), pdf_name=pdf_name)
+    reply = response.choices[0].message.content.strip()
+    logger.info(f"/pdf-chat  reply_len={len(reply)}")
+    return PdfChatResponse(reply=reply, pdf_name=pdf_name)
 
 
 # ── /code-questions ────────────────────────────────────────────────────────────
 
-CODE_QUESTIONS_PROMPT = """You are helping clarify a coding request before writing code.
-The user has asked: "{request}"
-
-Generate 2-3 SHORT, RELEVANT multiple-choice questions to clarify missing details.
-
-STRICT RULES:
-- NEVER ask about something the user already mentioned (e.g. language, framework, topic)
-- NEVER ask generic or obvious questions
-- Ask about things that will genuinely change how the code is written
-- Good question topics: complexity level, extra features, UI style, error handling, data storage, target audience
-- Each question must have 3-4 short options (1-5 words each)
-- If the request is already very detailed and nothing is missing, return an empty array []
-- Return ONLY a valid JSON array, no markdown fences, no explanation
-
-FORMAT:
-[
-  {{"question": "Question text?", "options": ["Option A", "Option B", "Option C"]}},
-  {{"question": "Another question?", "options": ["Option A", "Option B", "Option C", "Option D"]}}
-]"""
-
-
-class CodeQuestionsRequest(BaseModel):
-    message: str
-
-
-class CodeQuestion(BaseModel):
-    question: str
-    options: list[str]
-
-
-class CodeQuestionsResponse(BaseModel):
-    questions: list[CodeQuestion]
-
-
 @app.post("/code-questions", response_model=CodeQuestionsResponse)
 async def code_questions(req: CodeQuestionsRequest):
+    """
+    Given a coding request, returns 2-3 smart MCQ questions to clarify
+    what the user wants before writing the code. Skips anything already
+    mentioned (e.g. language, framework).
+    Returns empty list if request is already detailed enough.
+    """
     logger.info(f"/code-questions  msg={req.message[:80]!r}")
     prompt = CODE_QUESTIONS_PROMPT.format(request=req.message.strip())
     try:
@@ -706,7 +658,7 @@ async def code_questions(req: CodeQuestionsRequest):
             model=MODEL,
             messages=[
                 {"role": "system", "content": prompt},
-                {"role": "user",   "content": "Generate the questions now."},
+                {"role": "user",   "content": "Generate the clarifying questions now."},
             ],
             max_tokens=400,
             temperature=0.4,
@@ -716,7 +668,6 @@ async def code_questions(req: CodeQuestionsRequest):
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
 
     raw = response.choices[0].message.content.strip()
-    # Strip markdown fences if present
     clean = raw.replace("```json", "").replace("```", "").strip()
     try:
         data = json.loads(clean)
