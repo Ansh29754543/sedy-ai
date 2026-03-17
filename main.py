@@ -8,7 +8,7 @@ import logging
 import base64
 import re
 import httpx
-import replicate
+import asyncio
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
@@ -27,11 +27,11 @@ client = Groq(api_key=GROQ_API_KEY)
 
 MODEL = "llama-3.3-70b-versatile"
 
-SERPER_API_KEY = "f968d3ac4fea0ec018f949ec1f3ca1ed9218559e"
+SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 
 # ── Replicate API key ──────────────────────────────────────────────────────────
-REPLICATE_API_TOKEN = "r8_0ALmg7cHe0sdZUnygSRUfaaYcEbI2283enWDK"
-os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
+# Replace the value below with your real token from replicate.com
+REPLICATE_API_TOKEN = "r8_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -737,20 +737,60 @@ async def generate_image(req: ImageGenRequest):
     refined_prompt = await refine_image_prompt(req.prompt)
 
     try:
-        output = replicate.run(
-            "black-forest-labs/flux-schnell",
-            input={
-                "prompt": refined_prompt,
-                "num_outputs": 1,
-                "aspect_ratio": "1:1",
-                "output_format": "webp",
-                "output_quality": 90,
-            }
-        )
-        # output is a list of URLs
-        image_url = str(output[0]) if isinstance(output, list) else str(output)
-        logger.info(f"/generate-image  url={image_url[:80]}")
-        return ImageGenResponse(image_url=image_url, prompt_used=refined_prompt)
+        async with httpx.AsyncClient(timeout=60.0) as c:
+            # Step 1: create prediction
+            resp = await c.post(
+                "https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions",
+                headers={
+                    "Authorization": f"Bearer {REPLICATE_API_TOKEN}",
+                    "Content-Type": "application/json",
+                    "Prefer": "wait",
+                },
+                json={
+                    "input": {
+                        "prompt": refined_prompt,
+                        "num_outputs": 1,
+                        "aspect_ratio": "1:1",
+                        "output_format": "webp",
+                        "output_quality": 90,
+                    }
+                },
+            )
+            if resp.status_code not in (200, 201):
+                raise HTTPException(status_code=502, detail=f"Replicate rejected request: {resp.text[:200]}")
+
+            prediction = resp.json()
+
+            # If Prefer: wait returned a finished result immediately
+            if prediction.get("status") == "succeeded":
+                image_url = prediction["output"][0]
+                logger.info(f"/generate-image  url={image_url[:80]}")
+                return ImageGenResponse(image_url=image_url, prompt_used=refined_prompt)
+
+            prediction_id = prediction.get("id")
+            if not prediction_id:
+                raise HTTPException(status_code=502, detail="No prediction ID returned from Replicate.")
+
+            # Step 2: poll until done (max 30 attempts × 2s = 60s)
+            for _ in range(30):
+                await asyncio.sleep(2)
+                poll = await c.get(
+                    f"https://api.replicate.com/v1/predictions/{prediction_id}",
+                    headers={"Authorization": f"Bearer {REPLICATE_API_TOKEN}"},
+                )
+                result = poll.json()
+                status = result.get("status")
+                if status == "succeeded":
+                    image_url = result["output"][0]
+                    logger.info(f"/generate-image  url={image_url[:80]}")
+                    return ImageGenResponse(image_url=image_url, prompt_used=refined_prompt)
+                elif status == "failed":
+                    raise HTTPException(status_code=502, detail=f"Replicate generation failed: {result.get('error','unknown')}")
+
+            raise HTTPException(status_code=504, detail="Image generation timed out after 60 seconds.")
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Replicate error /generate-image: {e}")
         raise HTTPException(status_code=502, detail=f"Image generation failed: {e}")
