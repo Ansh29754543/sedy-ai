@@ -737,7 +737,7 @@ async def generate_image(req: ImageGenRequest):
 
     logger.info(f"/generate-image  prompt={req.prompt[:80]!r}")
 
-    if not HF_TOKEN or HF_TOKEN == "hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx":
+    if not HF_TOKEN or HF_TOKEN == "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":
         raise HTTPException(status_code=500, detail="HF_TOKEN is not configured. Get a free token at huggingface.co.")
 
     # Refine the user's short prompt into a rich generation prompt via Groq
