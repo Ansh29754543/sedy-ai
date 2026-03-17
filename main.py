@@ -31,7 +31,7 @@ SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 
 # ── Replicate API key ──────────────────────────────────────────────────────────
 # Replace the value below with your real token from replicate.com
-REPLICATE_API_TOKEN = "r8_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+REPLICATE_API_TOKEN = "r8_0ALmg7cHe0sdZUnygSRUfaaYcEbI2283enWDK"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
