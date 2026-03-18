@@ -604,7 +604,7 @@ async def chat(req: ChatRequest):
     messages = build_messages(SYSTEM_PROMPT, req.history, refined)
     try:
         response = client.chat.completions.create(
-            model=model, messages=messages, max_tokens=1024, temperature=0.7,
+            model=model, messages=messages, max_tokens=8192, temperature=0.7,
         )
     except Exception as e:
         logger.error(f"Groq error /chat: {e}")
