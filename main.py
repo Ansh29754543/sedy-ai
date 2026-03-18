@@ -8,18 +8,20 @@ import logging
 import base64
 import re
 import httpx
+import io
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 logger = logging.getLogger("sedy")
 
 # ── App ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Sedy API", version="3.3.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-# Allow large responses for base64 images
-from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
+app = FastAPI(title="Sedy API", version="3.4.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ── Groq client ────────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
@@ -27,10 +29,66 @@ if not GROQ_API_KEY:
     logger.warning("GROQ_API_KEY is not set — API calls will fail!")
 
 client = Groq(api_key=GROQ_API_KEY)
-
-MODEL = "llama-3.3-70b-versatile"
+MODEL  = "llama-3.3-70b-versatile"
 
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
+
+# ── PDF library (prefer pypdf, fall back to pdfplumber, then pymupdf) ──────────
+PDF_ENGINE = None
+try:
+    from pypdf import PdfReader as _PyPdfReader
+    PDF_ENGINE = "pypdf"
+    logger.info("PDF engine: pypdf")
+except ImportError:
+    try:
+        import pdfplumber as _pdfplumber
+        PDF_ENGINE = "pdfplumber"
+        logger.info("PDF engine: pdfplumber")
+    except ImportError:
+        try:
+            import fitz  # PyMuPDF
+            PDF_ENGINE = "pymupdf"
+            logger.info("PDF engine: pymupdf")
+        except ImportError:
+            logger.warning("No PDF library found! Install pypdf, pdfplumber, or PyMuPDF.")
+
+
+def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, int]:
+    """Return (full_text, page_count). Raises RuntimeError if no engine."""
+    if PDF_ENGINE == "pypdf":
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        pages  = reader.pages
+        text   = "\n".join(
+            f"\n--- Page {i+1} ---\n{p.extract_text() or ''}"
+            for i, p in enumerate(pages)
+        )
+        return text, len(pages)
+
+    elif PDF_ENGINE == "pdfplumber":
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            pages = pdf.pages
+            text  = "\n".join(
+                f"\n--- Page {i+1} ---\n{p.extract_text() or ''}"
+                for i, p in enumerate(pages)
+            )
+            return text, len(pages)
+
+    elif PDF_ENGINE == "pymupdf":
+        import fitz
+        doc   = fitz.open(stream=pdf_bytes, filetype="pdf")
+        text  = "\n".join(
+            f"\n--- Page {i+1} ---\n{doc[i].get_text()}"
+            for i in range(len(doc))
+        )
+        return text, len(doc)
+
+    else:
+        raise RuntimeError(
+            "No PDF library is installed on the server. "
+            "Please install 'pypdf' (pip install pypdf)."
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -54,16 +112,12 @@ STRICT MATH FORMATTING (frontend uses KaTeX):
 - NEVER write bare math like w^2 — always wrap in $w^2$
 - Fractions: $\\frac{a}{b}$  Subscripts: $A_{\\text{base}}$"""
 
-# ──────────────────────────────────────────────────────────────────────────────
-
 REFINE_SYSTEM_PROMPT = """You are a silent prompt refinement engine. Your ONLY job is to clean up a student's message.
 1. Fix spelling typos
 2. Fix grammar (keep casual tone)
 3. Resolve vague references ("it", "this", "that") using conversation history
 
 Output ONLY the refined message. No explanation, no preamble. If already perfect, output as-is."""
-
-# ──────────────────────────────────────────────────────────────────────────────
 
 GRAPH_REFINE_SYSTEM_PROMPT = """You are a silent prompt refinement engine for data visualisation requests.
 1. Fix spelling/grammar
@@ -73,8 +127,6 @@ GRAPH_REFINE_SYSTEM_PROMPT = """You are a silent prompt refinement engine for da
    - "compare/vs/ranking/top N" → append "(bar chart)"
    - "over time/trend/history" → append "(line chart)"
 Output ONLY the refined message."""
-
-# ──────────────────────────────────────────────────────────────────────────────
 
 GRAPH_SYSTEM_PROMPT = """You are a data assistant. Output ONLY a single valid JSON object — no prose, no markdown fences.
 
@@ -98,14 +150,16 @@ DATA RULES:
 - Time series: 8-20 points. Pie: 3-8 slices. Bar: 3-10 groups.
 - Use realistic historically plausible data."""
 
-# ──────────────────────────────────────────────────────────────────────────────
-
 PDF_SYSTEM_PROMPT = """You are Sedy, an intelligent student learning assistant made by Ansh Verma.
-The user has uploaded a PDF. Help them understand it — answer questions, summarize, explain concepts.
-Use LaTeX math: $...$ inline, $$...$$ display.
-Only answer based on document content."""
+The user has uploaded a PDF whose FULL TEXT is embedded below between === DOCUMENT START === and === DOCUMENT END ===.
 
-# ──────────────────────────────────────────────────────────────────────────────
+YOUR RULES:
+1. Base ALL answers strictly on the document text provided. Do NOT say "I don't have access" — the text IS right there.
+2. If asked to summarise: write ## headings for each major section, bullet-point the key ideas under each heading.
+3. If asked a question: find the relevant passage and explain it clearly. Quote the page number when useful.
+4. If the answer genuinely isn't in the document, say "This topic isn't covered in this PDF."
+5. Use markdown formatting (##, **, bullets). Use LaTeX for math: $...$ inline, $$...$$ display.
+6. Be thorough — do NOT give short or vague answers. Students need real detail."""
 
 INTENT_SYSTEM_PROMPT = """You are an intent classifier for a student learning app.
 Output EXACTLY one word from: graph, flashcard, quiz, both, chat, image
@@ -119,18 +173,15 @@ chat      = everything else
 
 No punctuation, no explanation. One word only."""
 
-# ──────────────────────────────────────────────────────────────────────────────
-
 CODE_QUESTIONS_PROMPT = """You are helping clarify a coding request before writing code.
 The user has asked: "{request}"
 
 Generate 2-3 SHORT, RELEVANT multiple-choice questions to clarify missing details.
 
 STRICT RULES:
-- NEVER ask about something the user already mentioned (e.g. if they said "Python", never ask language)
+- NEVER ask about something the user already mentioned
 - NEVER ask generic or obvious questions
 - Ask only about things that will genuinely change how the code is written
-- Good topics: complexity level, extra features, UI style, error handling, data storage
 - Each question must have 3-4 short options (1-5 words each)
 - If the request is already very detailed and nothing is missing, return an empty array []
 - Return ONLY a valid JSON array, no markdown fences, no explanation
@@ -140,8 +191,6 @@ FORMAT:
   {{"question": "Question text?", "options": ["Option A", "Option B", "Option C"]}},
   {{"question": "Another question?", "options": ["Option A", "Option B", "Option C", "Option D"]}}
 ]"""
-
-# ──────────────────────────────────────────────────────────────────────────────
 
 IMAGE_PROMPT_REFINE_SYSTEM = """You are a prompt engineer for AI image generation.
 The user has requested an image. Extract and expand their request into a clean,
@@ -257,7 +306,7 @@ class ImageGenResponse(BaseModel):
 
 def build_messages(system: str, history: list[HistoryEntry], user_message: str) -> list[dict]:
     messages = [{"role": "system", "content": system}]
-    trimmed = history[-20:] if len(history) > 20 else history
+    trimmed  = history[-20:] if len(history) > 20 else history
     sanitised: list[dict] = []
     for entry in trimmed:
         role = entry.role if entry.role in ("user", "assistant") else "user"
@@ -365,7 +414,6 @@ async def refine_graph_prompt(message: str, history: list[HistoryEntry]) -> str:
 
 
 async def refine_image_prompt(raw_prompt: str) -> str:
-    """Expand a short user image request into a rich generation prompt."""
     try:
         response = client.chat.completions.create(
             model=MODEL,
@@ -373,8 +421,7 @@ async def refine_image_prompt(raw_prompt: str) -> str:
                 {"role": "system", "content": IMAGE_PROMPT_REFINE_SYSTEM},
                 {"role": "user",   "content": raw_prompt},
             ],
-            max_tokens=180,
-            temperature=0.7,
+            max_tokens=180, temperature=0.7,
         )
         refined = response.choices[0].message.content.strip()
         if not refined:
@@ -410,18 +457,20 @@ async def fetch_live_data(query: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── ROUTES ────────────────────────────────────────────────────────────────────
+# ── ROUTES ────────────────────────────────────────────────────────════════════
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/")
 async def root():
     return {
         "status": "Sedy API is live 🚀",
-        "version": "3.3.0",
+        "version": "3.4.0",
         "model": MODEL,
+        "pdf_engine": PDF_ENGINE or "none — install pypdf!",
         "live_data": bool(SERPER_API_KEY),
         "image_gen": "huggingface FLUX.1-schnell (free)",
-        "endpoints": ["/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat", "/intent", "/code-questions", "/generate-image"],
+        "endpoints": ["/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat",
+                      "/intent", "/code-questions", "/generate-image"],
     }
 
 
@@ -444,7 +493,7 @@ async def detect_intent(req: IntentRequest):
             messages=[{"role": "system", "content": INTENT_SYSTEM_PROMPT}, {"role": "user", "content": user_content}],
             max_tokens=5, temperature=0.0,
         )
-        raw = response.choices[0].message.content.strip().lower()
+        raw    = response.choices[0].message.content.strip().lower()
         intent = raw if raw in ("graph", "flashcard", "quiz", "both", "image", "chat") else "chat"
         logger.info(f"/intent  result={intent!r}")
         return IntentResponse(intent=intent)
@@ -458,7 +507,7 @@ async def detect_intent(req: IntentRequest):
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     logger.info(f"/chat  history={len(req.history)}  msg={req.message[:80]!r}")
-    refined = await refine_prompt(req.message, req.history)
+    refined  = await refine_prompt(req.message, req.history)
     messages = build_messages(SYSTEM_PROMPT, req.history, refined)
     try:
         response = client.chat.completions.create(
@@ -500,7 +549,7 @@ async def flashcards(req: FlashcardRequest):
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
     raw = response.choices[0].message.content.strip()
     try:
-        data = extract_json_array(raw)
+        data  = extract_json_array(raw)
         cards = [
             Flashcard(
                 question=str(c.get("question") or c.get("front", "")),
@@ -528,7 +577,7 @@ async def quiz(req: QuizRequest):
     if not topic:
         raise HTTPException(status_code=400, detail="topic must not be empty")
     difficulty = req.difficulty if req.difficulty in ("easy", "medium", "hard") else "medium"
-    count = max(1, min(req.count, 20))
+    count      = max(1, min(req.count, 20))
     user_prompt = (
         f'Generate exactly {count} {difficulty} MCQs about "{topic}".\n'
         f'Return ONLY JSON array, no markdown:\n'
@@ -545,7 +594,7 @@ async def quiz(req: QuizRequest):
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
     raw = response.choices[0].message.content.strip()
     try:
-        data = extract_json_array(raw)
+        data      = extract_json_array(raw)
         questions = []
         for q in data:
             if not isinstance(q, dict):
@@ -577,9 +626,8 @@ async def quiz(req: QuizRequest):
 async def graph(req: GraphRequest):
     logger.info(f"/graph  msg={req.message[:80]!r}")
     refined = await refine_graph_prompt(req.message, req.history)
-    logger.info(f"/graph  refined='{refined[:80]}'")
     live_snippets = ""
-    data_source = "estimated"
+    data_source   = "estimated"
     if SERPER_API_KEY:
         live_snippets = await fetch_live_data(refined + " data statistics numbers")
         if live_snippets:
@@ -599,7 +647,7 @@ async def graph(req: GraphRequest):
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
     raw = strip_json_fences(response.choices[0].message.content.strip())
     try:
-        obj = json.loads(raw)
+        obj         = json.loads(raw)
         series_list = []
         for i, s in enumerate(obj.get("series", [])):
             pts = []
@@ -637,33 +685,69 @@ async def graph(req: GraphRequest):
 async def pdf_chat(req: PdfChatRequest):
     pdf_name = req.pdf_name.strip() or "document.pdf"
     logger.info(f"/pdf-chat  file={pdf_name!r}  msg={req.message[:80]!r}")
-    refined_message = await refine_prompt(req.message, req.history)
+
+    # ── 1. Decode base64 ────────────────────────────────────────────────────────
+    # Strip data-URL prefix if the client accidentally sent it
+    raw_b64 = req.pdf_base64
+    if "," in raw_b64:
+        raw_b64 = raw_b64.split(",", 1)[1]
+    # Remove whitespace that some clients insert
+    raw_b64 = raw_b64.strip().replace("\n", "").replace("\r", "").replace(" ", "")
     try:
-        pdf_bytes = base64.b64decode(req.pdf_base64)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid base64 PDF data")
-    pdf_text = ""
+        pdf_bytes = base64.b64decode(raw_b64)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 PDF data: {exc}")
+
+    # Sanity-check magic bytes
+    if not pdf_bytes.startswith(b"%PDF"):
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file does not appear to be a valid PDF (missing %PDF header).",
+        )
+
+    # ── 2. Extract text ─────────────────────────────────────────────────────────
     try:
-        from pypdf import PdfReader
-        import io
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        for i, page in enumerate(reader.pages):
-            pdf_text += f"\n--- Page {i+1} ---\n{page.extract_text() or ''}"
-        logger.info(f"/pdf-chat  {len(pdf_text)} chars from {len(reader.pages)} pages")
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Could not read PDF: {e}")
+        pdf_text, page_count = extract_pdf_text(pdf_bytes)
+        logger.info(f"/pdf-chat  {len(pdf_text)} chars from {page_count} pages  engine={PDF_ENGINE}")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Could not read PDF: {exc}")
+
     if not pdf_text.strip():
-        raise HTTPException(status_code=422, detail="PDF appears empty or image-only. Please try a text-based PDF.")
-    MAX_PDF_CHARS = 60_000
-    if len(pdf_text) > MAX_PDF_CHARS:
-        pdf_text = pdf_text[:MAX_PDF_CHARS] + "\n\n[... document truncated to fit context ...]"
-    doc_context = (
-        f'The user has uploaded a PDF named "{pdf_name}".\n'
-        f"=== DOCUMENT START ===\n{pdf_text}\n=== DOCUMENT END ==="
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This PDF appears to be image-only (scanned) and contains no extractable text. "
+                "Please try a text-based PDF, or copy-paste the text you'd like help with."
+            ),
+        )
+
+    # ── 3. Smart truncation — keep as much text as possible ────────────────────
+    # llama-3.3-70b on Groq supports large context; 80k chars is safe.
+    MAX_PDF_CHARS = 80_000
+    truncation_note = ""
+    original_len = len(pdf_text)
+    if original_len > MAX_PDF_CHARS:
+        pdf_text = pdf_text[:MAX_PDF_CHARS]
+        truncation_note = (
+            f"\n\n[NOTE: Document was {original_len} chars; showing first {MAX_PDF_CHARS}. "
+            f"Later pages may not be shown.]"
+        )
+
+    # ── 4. Build messages ───────────────────────────────────────────────────────
+    refined_message = await refine_prompt(req.message, req.history)
+
+    # Document text in system prompt = model treats it as ground-truth context
+    doc_block = (
+        f'\n\nDOCUMENT: "{pdf_name}" ({page_count} pages)\n'
+        f"=== DOCUMENT START ===\n{pdf_text}{truncation_note}\n=== DOCUMENT END ==="
     )
-    messages = [{"role": "system", "content": PDF_SYSTEM_PROMPT + "\n\n" + doc_context}]
+    messages: list[dict] = [{"role": "system", "content": PDF_SYSTEM_PROMPT + doc_block}]
+
+    # Keep last 6 turns for multi-turn PDF conversation
     sanitised: list[dict] = []
-    for entry in req.history[-10:]:
+    for entry in req.history[-6:]:
         role = entry.role if entry.role in ("user", "assistant") else "user"
         if sanitised and sanitised[-1]["role"] == role:
             sanitised[-1]["content"] += "\n" + entry.content
@@ -671,14 +755,22 @@ async def pdf_chat(req: PdfChatRequest):
             sanitised.append({"role": role, "content": entry.content})
     messages.extend(sanitised)
     messages.append({"role": "user", "content": refined_message})
+
+    # ── 5. Call LLM — bigger budget + lower temp for document-grounded answers ──
     try:
         response = client.chat.completions.create(
-            model=MODEL, messages=messages, max_tokens=1500, temperature=0.7,
+            model=MODEL,
+            messages=messages,
+            max_tokens=2048,   # was 1500 — summaries need more room
+            temperature=0.3,   # lower = faithful to doc, less hallucination
         )
     except Exception as e:
         logger.error(f"Groq error /pdf-chat: {e}")
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
+
     reply = response.choices[0].message.content.strip()
+    if not reply:
+        reply = "I couldn't generate a response. Please try rephrasing your question."
     logger.info(f"/pdf-chat  reply_len={len(reply)}")
     return PdfChatResponse(reply=reply, pdf_name=pdf_name)
 
@@ -696,13 +788,12 @@ async def code_questions(req: CodeQuestionsRequest):
                 {"role": "system", "content": prompt},
                 {"role": "user",   "content": "Generate the clarifying questions now."},
             ],
-            max_tokens=400,
-            temperature=0.4,
+            max_tokens=400, temperature=0.4,
         )
     except Exception as e:
         logger.error(f"Groq error /code-questions: {e}")
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
-    raw = response.choices[0].message.content.strip()
+    raw   = response.choices[0].message.content.strip()
     clean = raw.replace("```json", "").replace("```", "").strip()
     try:
         data = json.loads(clean)
@@ -725,26 +816,23 @@ async def code_questions(req: CodeQuestionsRequest):
 
 # ── /generate-image ────────────────────────────────────────────────────────────
 
-# Get your free token at huggingface.co → Settings → Access Tokens
-HF_TOKEN = "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"
-
-# Model to use — FLUX.1-schnell is fast and free
+HF_TOKEN     = os.environ.get("HF_TOKEN", "")
 HF_MODEL_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
 
 @app.post("/generate-image", response_model=ImageGenResponse)
 async def generate_image(req: ImageGenRequest):
     import asyncio
-
     logger.info(f"/generate-image  prompt={req.prompt[:80]!r}")
 
-    if not HF_TOKEN or HF_TOKEN == "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":
-        raise HTTPException(status_code=500, detail="HF_TOKEN is not configured. Get a free token at huggingface.co.")
+    if not HF_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="HF_TOKEN env var is not set. Get a free token at huggingface.co → Settings → Access Tokens.",
+        )
 
-    # Refine the user's short prompt into a rich generation prompt via Groq
     refined_prompt = await refine_image_prompt(req.prompt)
-    logger.info(f"/generate-image  refined={refined_prompt[:80]!r}")
+    last_error     = ""
 
-    last_error = ""
     for attempt in range(4):
         try:
             async with httpx.AsyncClient(timeout=120.0) as c:
@@ -757,9 +845,8 @@ async def generate_image(req: ImageGenRequest):
                     },
                     json={"inputs": refined_prompt},
                 )
-                logger.info(f"/generate-image  attempt={attempt+1}  status={resp.status_code}  content-type={resp.headers.get('content-type','?')}")
+                logger.info(f"/generate-image  attempt={attempt+1}  status={resp.status_code}")
 
-                # Model is loading — wait and retry
                 if resp.status_code == 503:
                     wait = resp.json().get("estimated_time", 20)
                     logger.info(f"/generate-image  model loading, waiting {wait}s...")
@@ -769,24 +856,19 @@ async def generate_image(req: ImageGenRequest):
                 if resp.status_code == 200:
                     content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
                     if not content_type.startswith("image/"):
-                        last_error = f"HuggingFace returned non-image: {content_type} — {resp.text[:150]}"
-                        logger.warning(f"/generate-image  {last_error}")
+                        last_error = f"HuggingFace returned non-image: {content_type}"
                         await asyncio.sleep(5)
                         continue
-
-                    img_b64 = base64.b64encode(resp.content).decode("utf-8")
+                    img_b64  = base64.b64encode(resp.content).decode("utf-8")
                     data_url = f"data:{content_type};base64,{img_b64}"
                     logger.info(f"/generate-image  success  size={len(resp.content)//1024}KB")
                     return ImageGenResponse(image_url=data_url, prompt_used=refined_prompt)
 
-                # Any other error
                 last_error = f"HuggingFace HTTP {resp.status_code}: {resp.text[:200]}"
-                logger.warning(f"/generate-image  {last_error}")
                 await asyncio.sleep(5)
 
         except httpx.TimeoutException:
             last_error = f"Request timed out on attempt {attempt+1}"
-            logger.warning(f"/generate-image  {last_error}")
             await asyncio.sleep(5)
         except Exception as e:
             last_error = str(e)
