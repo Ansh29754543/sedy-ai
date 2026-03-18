@@ -32,9 +32,9 @@ client = Groq(api_key=GROQ_API_KEY)
 
 # ── Available models ───────────────────────────────────────────────────────────
 MODELS = {
-    "pro":   "llama-3.3-70b-versatile",   # Sedy Pro   — best quality
-    "flash": "llama-3.1-8b-instant",       # Sedy Flash — fastest
-    "smart": "qwen/qwen3-32b",             # Sedy Smart — multilingual, reasoning, 128K context
+    "pro":   "llama-3.3-70b-versatile",   # Sedy Pro   — best quality, complex reasoning
+    "flash": "llama-3.1-8b-instant",       # Sedy Flash — fastest, lightweight tasks
+    "smart": "qwen/qwen3-32b",             # Sedy Smart — coding, math, JSON, multilingual
 }
 
 # Models that do NOT support a system role (none currently)
@@ -43,15 +43,15 @@ DEFAULT_MODEL = MODELS["pro"]
 
 # Auto-select: pick best model for each task type
 AUTO_MODEL_MAP = {
-    "chat":       MODELS["pro"],    # complex explanations need best model
-    "pdf":        MODELS["pro"],    # PDF reading needs full context window
-    "flashcard":  MODELS["smart"],  # structured JSON → Gemma is great at this
-    "quiz":       MODELS["smart"],  # structured JSON → Gemma is great at this
-    "graph":      MODELS["smart"],  # JSON output → Gemma handles well
-    "image":      MODELS["flash"],  # just refining a prompt → fast is fine
-    "code":       MODELS["pro"],    # code generation → needs best
+    "chat":       MODELS["pro"],    # complex explanations → best model
+    "pdf":        MODELS["pro"],    # PDF reading/summarising → best context understanding
+    "code":       MODELS["smart"],  # coding → Qwen3 built for code & logic
+    "flashcard":  MODELS["smart"],  # structured JSON output → Qwen3 excels
+    "quiz":       MODELS["smart"],  # structured JSON output → Qwen3 excels
+    "graph":      MODELS["smart"],  # JSON chart data → Qwen3 excels
+    "image":      MODELS["flash"],  # just refining a prompt → speed matters
     "intent":     MODELS["flash"],  # single-word classification → fastest
-    "refine":     MODELS["flash"],  # prompt refinement → fastest
+    "refine":     MODELS["flash"],  # prompt cleanup → simple task, fast
 }
 
 def resolve_model(requested: str | None, task: str = "chat") -> str:
@@ -406,8 +406,13 @@ def build_messages(system: str, history: list[HistoryEntry], user_message: str) 
     return messages
 
 
+def strip_think_tags(raw: str) -> str:
+    """Remove Qwen3 <think>...</think> reasoning tokens from output."""
+    return re.sub(r'<think>[\s\S]*?</think>', '', raw).strip()
+
+
 def extract_json_array(raw: str) -> list:
-    raw = raw.strip()
+    raw = strip_think_tags(raw).strip()
     if raw.startswith("```"):
         raw = raw.split("```", 2)[1]
         if raw.startswith("json"):
@@ -421,7 +426,7 @@ def extract_json_array(raw: str) -> list:
 
 
 def strip_json_fences(raw: str) -> str:
-    raw = raw.strip()
+    raw = strip_think_tags(raw).strip()
     if raw.startswith("```"):
         raw = raw.split("```", 2)[1]
         if raw.startswith("json"):
@@ -607,7 +612,7 @@ async def chat(req: ChatRequest):
         if rl:
             raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
-    reply = response.choices[0].message.content.strip()
+    reply = strip_think_tags(response.choices[0].message.content.strip())
     logger.info(f"/chat  reply_len={len(reply)}")
     return ChatResponse(reply=reply)
 
@@ -909,7 +914,7 @@ async def pdf_chat(req: PdfChatRequest):
             raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
 
-    reply = response.choices[0].message.content.strip()
+    reply = strip_think_tags(response.choices[0].message.content.strip())
     if not reply:
         reply = "I couldn't generate a response. Please try rephrasing your question."
     logger.info(f"/pdf-chat  reply_len={len(reply)}")
