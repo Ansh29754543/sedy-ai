@@ -533,16 +533,33 @@ async def flashcards(req: FlashcardRequest):
     topic = resolve_topic_from_history(topic, req.history)
     if not topic:
         raise HTTPException(status_code=400, detail="topic must not be empty")
-    count = max(1, min(req.count, 20))
+    # count == 0  →  AI decides how many cards are needed
+    # count  > 0  →  honour exactly (up to 50)
+    auto_count = req.count == 0
+    count = max(1, min(req.count, 50)) if not auto_count else 0
+
+    if not auto_count:
+        count_instr = f"Generate exactly {count} flashcards"
+    else:
+        count_instr = (
+            "Decide for yourself how many flashcards are needed to fully cover every "
+            "important concept in this topic. "
+            "Use your judgment: simple/narrow topics need 8-12 cards; "
+            "broad, multi-concept, or multi-chapter topics need 15-30 cards. "
+            "Generate ALL the cards needed — do NOT stop early."
+        )
+
     user_prompt = (
-        f'Generate exactly {count} flashcards about "{topic}".\n'
-        f'Return ONLY a JSON array, no markdown:\n[{{"question":"...","answer":"..."}}]'
+        f'{count_instr} about "{topic}".\n'
+        f'Each card must cover a distinct concept — no duplicates.\n'
+        f'Return ONLY a valid JSON array, no markdown, no extra text:\n'
+        f'[{{"question":"...","answer":"..."}}]'
     )
     try:
         response = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}],
-            max_tokens=1500, temperature=0.7,
+            max_tokens=4096, temperature=0.7,
         )
     except Exception as e:
         logger.error(f"Groq error /flashcards: {e}")
@@ -577,17 +594,34 @@ async def quiz(req: QuizRequest):
     if not topic:
         raise HTTPException(status_code=400, detail="topic must not be empty")
     difficulty = req.difficulty if req.difficulty in ("easy", "medium", "hard") else "medium"
-    count      = max(1, min(req.count, 20))
+
+    # count == 0  →  AI decides how many questions are needed
+    # count  > 0  →  honour exactly (up to 50)
+    auto_count = req.count == 0
+    count = max(1, min(req.count, 50)) if not auto_count else 0
+
+    if not auto_count:
+        count_instr = f"Generate exactly {count} {difficulty} MCQ questions"
+    else:
+        count_instr = (
+            f"Decide for yourself how many {difficulty} MCQ questions are needed to "
+            f"properly test every important concept in this topic. "
+            f"Use your judgment: focused topics need 8-10 questions; "
+            f"broad or multi-chapter topics need 12-20 questions. "
+            f"Generate ALL necessary questions — do NOT cut short."
+        )
+
     user_prompt = (
-        f'Generate exactly {count} {difficulty} MCQs about "{topic}".\n'
-        f'Return ONLY JSON array, no markdown:\n'
+        f'{count_instr} about "{topic}".\n'
+        f'Each question must test a different concept — no duplicates.\n'
+        f'Return ONLY a valid JSON array, no markdown, no extra text:\n'
         f'[{{"question":"...","options":["A","B","C","D"],"answer":0,"explanation":"..."}}]'
     )
     try:
         response = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}],
-            max_tokens=2000, temperature=0.7,
+            max_tokens=4096, temperature=0.7,
         )
     except Exception as e:
         logger.error(f"Groq error /quiz: {e}")
