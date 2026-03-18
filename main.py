@@ -29,7 +29,37 @@ if not GROQ_API_KEY:
     logger.warning("GROQ_API_KEY is not set — API calls will fail!")
 
 client = Groq(api_key=GROQ_API_KEY)
-MODEL  = "llama-3.3-70b-versatile"
+
+# ── Available models ───────────────────────────────────────────────────────────
+MODELS = {
+    "pro":   "llama-3.3-70b-versatile",   # Sedy Pro   — best quality
+    "flash": "llama-3.1-8b-instant",       # Sedy Flash — fastest
+    "smart": "gemma2-9b-it",               # Sedy Smart — structured/quizzes
+}
+DEFAULT_MODEL = MODELS["pro"]
+
+# Auto-select: pick best model for each task type
+AUTO_MODEL_MAP = {
+    "chat":       MODELS["pro"],    # complex explanations need best model
+    "pdf":        MODELS["pro"],    # PDF reading needs full context window
+    "flashcard":  MODELS["smart"],  # structured JSON → Gemma is great at this
+    "quiz":       MODELS["smart"],  # structured JSON → Gemma is great at this
+    "graph":      MODELS["smart"],  # JSON output → Gemma handles well
+    "image":      MODELS["flash"],  # just refining a prompt → fast is fine
+    "code":       MODELS["pro"],    # code generation → needs best
+    "intent":     MODELS["flash"],  # single-word classification → fastest
+    "refine":     MODELS["flash"],  # prompt refinement → fastest
+}
+
+def resolve_model(requested: str | None, task: str = "chat") -> str:
+    """
+    requested: 'auto' | 'pro' | 'flash' | 'smart' | None
+    task:      one of the AUTO_MODEL_MAP keys
+    Returns the actual model string to use.
+    """
+    if not requested or requested == "auto":
+        return AUTO_MODEL_MAP.get(task, DEFAULT_MODEL)
+    return MODELS.get(requested, DEFAULT_MODEL)
 
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 
@@ -209,28 +239,33 @@ class HistoryEntry(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     history: list[HistoryEntry] = []
+    model: str = "auto"
 
 class FlashcardRequest(BaseModel):
     topic: str
     count: int = 6
     history: list[HistoryEntry] = []
+    model: str = "auto"
 
 class QuizRequest(BaseModel):
     topic: str
     difficulty: str = "medium"
     count: int = 5
     history: list[HistoryEntry] = []
+    model: str = "auto"
 
 class GraphRequest(BaseModel):
     message: str
     chart_type: str = "auto"
     history: list[HistoryEntry] = []
+    model: str = "auto"
 
 class PdfChatRequest(BaseModel):
     message: str
     pdf_base64: str
     pdf_name: str = "document.pdf"
     history: list[HistoryEntry] = []
+    model: str = "auto"
 
 class ImageGenRequest(BaseModel):
     prompt: str
@@ -303,6 +338,55 @@ class ImageGenResponse(BaseModel):
 # ══════════════════════════════════════════════════════════════════════════════
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
+
+def parse_rate_limit_error(exc: Exception) -> dict | None:
+    """
+    If exc is a Groq 429 rate-limit error, return:
+      { "type": "rate_limit", "wait_seconds": int, "wait_display": "17m 35s",
+        "limit_type": "TPD" | "TPM" | "RPM", "used": int, "limit": int }
+    Otherwise return None.
+    """
+    import re as _re
+    msg = str(exc)
+    if "429" not in msg and "rate_limit" not in msg.lower():
+        return None
+
+    wait_sec = 0
+    wait_str = ""
+    m = _re.search(r'try again in\s+([\dhms. ]+)', msg, _re.I)
+    if m:
+        raw = m.group(1).strip()
+        wait_str = raw
+        # parse "17m35.808s" or "2h 3m 10s" or "45.5s"
+        hours   = sum(float(x) for x in _re.findall(r'([\d.]+)h', raw))
+        minutes = sum(float(x) for x in _re.findall(r'([\d.]+)m', raw))
+        seconds = sum(float(x) for x in _re.findall(r'([\d.]+)s', raw))
+        wait_sec = int(hours * 3600 + minutes * 60 + seconds)
+
+    limit_type = "tokens"
+    if "tokens per minute" in msg.lower() or "TPM" in msg:
+        limit_type = "TPM"
+    elif "tokens per day" in msg.lower() or "TPD" in msg:
+        limit_type = "TPD"
+    elif "requests per minute" in msg.lower() or "RPM" in msg:
+        limit_type = "RPM"
+
+    used  = 0
+    limit = 0
+    mu = _re.search(r'Used\s+([\d,]+)', msg)
+    ml = _re.search(r'Limit\s+([\d,]+)', msg)
+    if mu: used  = int(mu.group(1).replace(',',''))
+    if ml: limit = int(ml.group(1).replace(',',''))
+
+    return {
+        "type":         "rate_limit",
+        "wait_seconds": wait_sec,
+        "wait_display": wait_str,
+        "limit_type":   limit_type,
+        "used":         used,
+        "limit":        limit,
+    }
+
 
 def build_messages(system: str, history: list[HistoryEntry], user_message: str) -> list[dict]:
     messages = [{"role": "system", "content": system}]
@@ -395,7 +479,7 @@ async def refine_prompt(message: str, history: list[HistoryEntry],
     )
     try:
         response = client.chat.completions.create(
-            model=MODEL,
+            model=MODELS["flash"],
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}],
             max_tokens=256, temperature=0.2,
         )
@@ -416,7 +500,7 @@ async def refine_graph_prompt(message: str, history: list[HistoryEntry]) -> str:
 async def refine_image_prompt(raw_prompt: str) -> str:
     try:
         response = client.chat.completions.create(
-            model=MODEL,
+            model=MODELS["flash"],
             messages=[
                 {"role": "system", "content": IMAGE_PROMPT_REFINE_SYSTEM},
                 {"role": "user",   "content": raw_prompt},
@@ -489,7 +573,7 @@ async def detect_intent(req: IntentRequest):
     )
     try:
         response = client.chat.completions.create(
-            model=MODEL,
+            model=MODELS["flash"],
             messages=[{"role": "system", "content": INTENT_SYSTEM_PROMPT}, {"role": "user", "content": user_content}],
             max_tokens=5, temperature=0.0,
         )
@@ -506,15 +590,19 @@ async def detect_intent(req: IntentRequest):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    logger.info(f"/chat  history={len(req.history)}  msg={req.message[:80]!r}")
+    model = resolve_model(req.model, "chat")
+    logger.info(f"/chat  model={model}  history={len(req.history)}  msg={req.message[:80]!r}")
     refined  = await refine_prompt(req.message, req.history)
     messages = build_messages(SYSTEM_PROMPT, req.history, refined)
     try:
         response = client.chat.completions.create(
-            model=MODEL, messages=messages, max_tokens=1024, temperature=0.7,
+            model=model, messages=messages, max_tokens=1024, temperature=0.7,
         )
     except Exception as e:
         logger.error(f"Groq error /chat: {e}")
+        rl = parse_rate_limit_error(e)
+        if rl:
+            raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
     reply = response.choices[0].message.content.strip()
     logger.info(f"/chat  reply_len={len(reply)}")
@@ -525,7 +613,8 @@ async def chat(req: ChatRequest):
 
 @app.post("/flashcards", response_model=FlashcardResponse)
 async def flashcards(req: FlashcardRequest):
-    logger.info(f"/flashcards  topic={req.topic!r}")
+    model = resolve_model(req.model, "flashcard")
+    logger.info(f"/flashcards  model={model}  topic={req.topic!r}")
     topic_as_prompt = f"Generate flashcards about {req.topic.strip()}"
     refined = await refine_prompt(topic_as_prompt, req.history)
     m = re.search(r'(?:flashcards?\s+(?:about|on|for)\s+|flashcards?\s+)(.+)', refined, re.I)
@@ -557,12 +646,15 @@ async def flashcards(req: FlashcardRequest):
     )
     try:
         response = client.chat.completions.create(
-            model=MODEL,
+            model=model,
             messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}],
             max_tokens=4096, temperature=0.7,
         )
     except Exception as e:
         logger.error(f"Groq error /flashcards: {e}")
+        rl = parse_rate_limit_error(e)
+        if rl:
+            raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
     raw = response.choices[0].message.content.strip()
     try:
@@ -585,7 +677,8 @@ async def flashcards(req: FlashcardRequest):
 
 @app.post("/quiz", response_model=QuizResponse)
 async def quiz(req: QuizRequest):
-    logger.info(f"/quiz  topic={req.topic!r}")
+    model = resolve_model(req.model, "quiz")
+    logger.info(f"/quiz  model={model}  topic={req.topic!r}")
     topic_as_prompt = f"Quiz me on {req.topic.strip()}"
     refined = await refine_prompt(topic_as_prompt, req.history)
     m = re.search(r'(?:quiz\s+(?:me\s+)?(?:on|about)\s+)(.+)', refined, re.I)
@@ -619,12 +712,15 @@ async def quiz(req: QuizRequest):
     )
     try:
         response = client.chat.completions.create(
-            model=MODEL,
+            model=model,
             messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}],
             max_tokens=4096, temperature=0.7,
         )
     except Exception as e:
         logger.error(f"Groq error /quiz: {e}")
+        rl = parse_rate_limit_error(e)
+        if rl:
+            raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
     raw = response.choices[0].message.content.strip()
     try:
@@ -658,7 +754,8 @@ async def quiz(req: QuizRequest):
 
 @app.post("/graph", response_model=GraphResponse)
 async def graph(req: GraphRequest):
-    logger.info(f"/graph  msg={req.message[:80]!r}")
+    model = resolve_model(req.model, "graph")
+    logger.info(f"/graph  model={model}  msg={req.message[:80]!r}")
     refined = await refine_graph_prompt(req.message, req.history)
     live_snippets = ""
     data_source   = "estimated"
@@ -672,12 +769,15 @@ async def graph(req: GraphRequest):
     )
     try:
         response = client.chat.completions.create(
-            model=MODEL,
+            model=model,
             messages=[{"role": "system", "content": GRAPH_SYSTEM_PROMPT}, {"role": "user", "content": user_content}],
             max_tokens=2500, temperature=0.3,
         )
     except Exception as e:
         logger.error(f"Groq error /graph: {e}")
+        rl = parse_rate_limit_error(e)
+        if rl:
+            raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
     raw = strip_json_fences(response.choices[0].message.content.strip())
     try:
@@ -717,8 +817,9 @@ async def graph(req: GraphRequest):
 
 @app.post("/pdf-chat", response_model=PdfChatResponse)
 async def pdf_chat(req: PdfChatRequest):
+    model = resolve_model(req.model, "pdf")
     pdf_name = req.pdf_name.strip() or "document.pdf"
-    logger.info(f"/pdf-chat  file={pdf_name!r}  msg={req.message[:80]!r}")
+    logger.info(f"/pdf-chat  model={model}  file={pdf_name!r}  msg={req.message[:80]!r}")
 
     # ── 1. Decode base64 ────────────────────────────────────────────────────────
     # Strip data-URL prefix if the client accidentally sent it
@@ -793,13 +894,16 @@ async def pdf_chat(req: PdfChatRequest):
     # ── 5. Call LLM — bigger budget + lower temp for document-grounded answers ──
     try:
         response = client.chat.completions.create(
-            model=MODEL,
+            model=model,
             messages=messages,
-            max_tokens=2048,   # was 1500 — summaries need more room
-            temperature=0.3,   # lower = faithful to doc, less hallucination
+            max_tokens=2048,
+            temperature=0.3,
         )
     except Exception as e:
         logger.error(f"Groq error /pdf-chat: {e}")
+        rl = parse_rate_limit_error(e)
+        if rl:
+            raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
 
     reply = response.choices[0].message.content.strip()
@@ -817,7 +921,7 @@ async def code_questions(req: CodeQuestionsRequest):
     prompt = CODE_QUESTIONS_PROMPT.format(request=req.message.strip())
     try:
         response = client.chat.completions.create(
-            model=MODEL,
+            model=MODELS["smart"],
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user",   "content": "Generate the clarifying questions now."},
@@ -826,6 +930,9 @@ async def code_questions(req: CodeQuestionsRequest):
         )
     except Exception as e:
         logger.error(f"Groq error /code-questions: {e}")
+        rl = parse_rate_limit_error(e)
+        if rl:
+            raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
     raw   = response.choices[0].message.content.strip()
     clean = raw.replace("```json", "").replace("```", "").strip()
