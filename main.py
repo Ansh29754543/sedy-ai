@@ -34,8 +34,11 @@ client = Groq(api_key=GROQ_API_KEY)
 MODELS = {
     "pro":   "llama-3.3-70b-versatile",   # Sedy Pro   — best quality
     "flash": "llama-3.1-8b-instant",       # Sedy Flash — fastest
-    "smart": "gemma2-9b-it",               # Sedy Smart — structured/quizzes
+    "smart": "qwen/qwen3-32b",             # Sedy Smart — multilingual, reasoning, 128K context
 }
+
+# Models that do NOT support a system role (none currently)
+NO_SYSTEM_ROLE_MODELS: set[str] = set()
 DEFAULT_MODEL = MODELS["pro"]
 
 # Auto-select: pick best model for each task type
