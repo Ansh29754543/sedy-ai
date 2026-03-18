@@ -32,9 +32,10 @@ client = Groq(api_key=GROQ_API_KEY)
 
 # ── Available models ───────────────────────────────────────────────────────────
 MODELS = {
-    "pro":   "llama-3.3-70b-versatile",   # Sedy Pro   — best quality, complex reasoning
-    "flash": "llama-3.1-8b-instant",       # Sedy Flash — fastest, lightweight tasks
-    "smart": "qwen/qwen3-32b",             # Sedy Smart — coding, math, JSON, multilingual
+    "pro":   "llama-3.3-70b-versatile",        # Sedy Pro   — best quality, complex reasoning
+    "flash": "llama-3.1-8b-instant",            # Sedy Flash — fastest, lightweight tasks
+    "smart": "qwen/qwen3-32b",                  # Sedy Smart — reasoning, JSON, multilingual
+    "code":  "deepseek-r1-distill-qwen-32b",    # internal code model — best coding on Groq
 }
 
 # Models that do NOT support a system role (none currently)
@@ -45,7 +46,7 @@ DEFAULT_MODEL = MODELS["pro"]
 AUTO_MODEL_MAP = {
     "chat":       MODELS["pro"],    # complex explanations → best model
     "pdf":        MODELS["pro"],    # PDF reading/summarising → best context understanding
-    "code":       MODELS["smart"],  # coding → Qwen3 built for code & logic
+    "code":       MODELS["code"],   # coding → deepseek best coding model on Groq
     "flashcard":  MODELS["smart"],  # structured JSON output → Qwen3 excels
     "quiz":       MODELS["smart"],  # structured JSON output → Qwen3 excels
     "graph":      MODELS["smart"],  # JSON chart data → Qwen3 excels
@@ -604,7 +605,7 @@ async def chat(req: ChatRequest):
     messages = build_messages(SYSTEM_PROMPT, req.history, refined)
     try:
         response = client.chat.completions.create(
-            model=model, messages=messages, max_tokens=8192, temperature=0.7,
+            model=model, messages=messages, max_tokens=32768, temperature=0.7,
         )
     except Exception as e:
         logger.error(f"Groq error /chat: {e}")
@@ -656,7 +657,7 @@ async def flashcards(req: FlashcardRequest):
         response = client.chat.completions.create(
             model=model,
             messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}],
-            max_tokens=4096, temperature=0.7,
+            max_tokens=32768, temperature=0.7,
         )
     except Exception as e:
         logger.error(f"Groq error /flashcards: {e}")
@@ -722,7 +723,7 @@ async def quiz(req: QuizRequest):
         response = client.chat.completions.create(
             model=model,
             messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}],
-            max_tokens=4096, temperature=0.7,
+            max_tokens=32768, temperature=0.7,
         )
     except Exception as e:
         logger.error(f"Groq error /quiz: {e}")
@@ -779,7 +780,7 @@ async def graph(req: GraphRequest):
         response = client.chat.completions.create(
             model=model,
             messages=[{"role": "system", "content": GRAPH_SYSTEM_PROMPT}, {"role": "user", "content": user_content}],
-            max_tokens=2500, temperature=0.3,
+            max_tokens=32768, temperature=0.3,
         )
     except Exception as e:
         logger.error(f"Groq error /graph: {e}")
@@ -904,7 +905,7 @@ async def pdf_chat(req: PdfChatRequest):
         response = client.chat.completions.create(
             model=model,
             messages=messages,
-            max_tokens=2048,
+            max_tokens=32768,
             temperature=0.3,
         )
     except Exception as e:
