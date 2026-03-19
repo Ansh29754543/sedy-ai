@@ -1007,7 +1007,7 @@ async def code_questions(req: CodeQuestionsRequest):
 # ── /generate-image ────────────────────────────────────────────────────────────
 
 HF_TOKEN     = os.environ.get("HF_TOKEN", "")
-HF_MODEL_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+HF_MODEL_URL = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell/v1/text-to-image"
 
 @app.post("/generate-image", response_model=ImageGenResponse)
 async def generate_image(req: ImageGenRequest):
@@ -1030,12 +1030,14 @@ async def generate_image(req: ImageGenRequest):
                     HF_MODEL_URL,
                     headers={
                         "Authorization": f"Bearer {HF_TOKEN}",
-                        "Accept": "image/jpeg",
-                        "x-use-cache": "false",
+                        "Content-Type": "application/json",
                     },
-                    json={"inputs": refined_prompt},
+                    json={
+                        "inputs": refined_prompt,
+                        "parameters": {"num_inference_steps": 4}
+                    },
                 )
-                logger.info(f"/generate-image  attempt={attempt+1}  status={resp.status_code}")
+                logger.info(f"/generate-image  attempt={attempt+1}  status={resp.status_code}  ct={resp.headers.get('content-type','?')}")
 
                 if resp.status_code == 503:
                     wait = resp.json().get("estimated_time", 20)
@@ -1044,15 +1046,33 @@ async def generate_image(req: ImageGenRequest):
                     continue
 
                 if resp.status_code == 200:
-                    content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
-                    if not content_type.startswith("image/"):
-                        last_error = f"HuggingFace returned non-image: {content_type}"
-                        await asyncio.sleep(5)
-                        continue
-                    img_b64  = base64.b64encode(resp.content).decode("utf-8")
-                    data_url = f"data:{content_type};base64,{img_b64}"
-                    logger.info(f"/generate-image  success  size={len(resp.content)//1024}KB")
-                    return ImageGenResponse(image_url=data_url, prompt_used=refined_prompt)
+                    content_type = resp.headers.get("content-type", "").split(";")[0].strip()
+
+                    # New router API returns raw image bytes directly
+                    if content_type.startswith("image/"):
+                        img_b64  = base64.b64encode(resp.content).decode("utf-8")
+                        data_url = f"data:{content_type};base64,{img_b64}"
+                        logger.info(f"/generate-image  success (raw)  size={len(resp.content)//1024}KB")
+                        return ImageGenResponse(image_url=data_url, prompt_used=refined_prompt)
+
+                    # Some responses come as JSON with base64
+                    if "application/json" in content_type or content_type == "":
+                        try:
+                            j = resp.json()
+                            # Format: [{"image": "base64..."}] or {"image": "base64..."}
+                            if isinstance(j, list) and j:
+                                j = j[0]
+                            img_data = j.get("image") or j.get("data") or j.get("b64_json")
+                            if img_data:
+                                data_url = f"data:image/jpeg;base64,{img_data}"
+                                logger.info(f"/generate-image  success (json b64)")
+                                return ImageGenResponse(image_url=data_url, prompt_used=refined_prompt)
+                        except Exception:
+                            pass
+
+                    last_error = f"Unexpected content-type: {content_type} — {resp.text[:150]}"
+                    await asyncio.sleep(5)
+                    continue
 
                 last_error = f"HuggingFace HTTP {resp.status_code}: {resp.text[:200]}"
                 await asyncio.sleep(5)
