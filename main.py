@@ -50,7 +50,6 @@ AUTO_MODEL_MAP = {
     "flashcard":  MODELS["smart"],  # structured JSON output → Qwen3 excels
     "quiz":       MODELS["smart"],  # structured JSON output → Qwen3 excels
     "graph":      MODELS["smart"],  # JSON chart data → Qwen3 excels
-    "image":      MODELS["flash"],  # just refining a prompt → speed matters
     "intent":     MODELS["flash"],  # single-word classification → fastest
     "refine":     MODELS["flash"],  # prompt cleanup → simple task, fast
 }
@@ -253,10 +252,6 @@ FORMAT:
   {{"question": "Another question?", "options": ["Option A", "Option B", "Option C", "Option D"]}}
 ]"""
 
-IMAGE_PROMPT_REFINE_SYSTEM = """You are a prompt engineer for AI image generation.
-The user has requested an image. Extract and expand their request into a clean,
-detailed image generation prompt (max 120 words). Be descriptive about style,
-lighting, composition, and mood. Output ONLY the refined prompt, nothing else."""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -298,8 +293,6 @@ class PdfChatRequest(BaseModel):
     history: list[HistoryEntry] = []
     model: str = "auto"
 
-class ImageGenRequest(BaseModel):
-    prompt: str
 
 class ChatResponse(BaseModel):
     reply: str
@@ -361,9 +354,6 @@ class CodeQuestion(BaseModel):
 class CodeQuestionsResponse(BaseModel):
     questions: list[CodeQuestion]
 
-class ImageGenResponse(BaseModel):
-    image_url: str
-    prompt_used: str
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -546,24 +536,6 @@ async def refine_graph_prompt(message: str, history: list[HistoryEntry]) -> str:
     return await refine_prompt(message, history, system_prompt=GRAPH_REFINE_SYSTEM_PROMPT)
 
 
-async def refine_image_prompt(raw_prompt: str) -> str:
-    try:
-        response = client.chat.completions.create(
-            model=MODELS["flash"],
-            messages=[
-                {"role": "system", "content": IMAGE_PROMPT_REFINE_SYSTEM},
-                {"role": "user",   "content": raw_prompt},
-            ],
-            max_tokens=180, temperature=0.7,
-        )
-        refined = response.choices[0].message.content.strip()
-        if not refined:
-            return raw_prompt
-        logger.info(f"image prompt refined: '{raw_prompt[:50]}' → '{refined[:60]}'")
-        return refined
-    except Exception as e:
-        logger.warning(f"refine_image_prompt failed ({e}), using original")
-        return raw_prompt
 
 
 async def fetch_live_data(query: str) -> str:
@@ -603,7 +575,7 @@ async def root():
         "live_data": bool(SERPER_API_KEY),
         "image_gen": "huggingface FLUX.1-schnell (free)",
         "endpoints": ["/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat",
-                      "/intent", "/code-questions", "/generate-image"],
+                      "/intent", "/code-questions"],
     }
 
 
@@ -1002,99 +974,3 @@ async def code_questions(req: CodeQuestionsRequest):
     except Exception as e:
         logger.warning(f"/code-questions  parse failed: {e}  raw={raw[:200]!r}")
         return CodeQuestionsResponse(questions=[])
-
-
-# ── /generate-image ────────────────────────────────────────────────────────────
-
-HF_TOKEN     = os.environ.get("HF_TOKEN", "")
-HF_MODEL_URL = "https://router.huggingface.co/fal-ai/flux/schnell"
-
-@app.post("/generate-image", response_model=ImageGenResponse)
-async def generate_image(req: ImageGenRequest):
-    import asyncio
-    logger.info(f"/generate-image  prompt={req.prompt[:80]!r}")
-
-    if not HF_TOKEN:
-        raise HTTPException(
-            status_code=500,
-            detail="HF_TOKEN env var is not set. Get a free token at huggingface.co → Settings → Access Tokens.",
-        )
-
-    refined_prompt = await refine_image_prompt(req.prompt)
-    last_error     = ""
-
-    for attempt in range(4):
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as c:
-                resp = await c.post(
-                    HF_MODEL_URL,
-                    headers={
-                        "Authorization": f"Bearer {HF_TOKEN}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "prompt": refined_prompt,
-                        "num_inference_steps": 4,
-                        "image_size": "landscape_4_3",
-                    },
-                )
-                logger.info(f"/generate-image  attempt={attempt+1}  status={resp.status_code}  ct={resp.headers.get('content-type','?')}")
-
-                if resp.status_code == 503:
-                    wait = resp.json().get("estimated_time", 20)
-                    logger.info(f"/generate-image  model loading, waiting {wait}s...")
-                    await asyncio.sleep(min(float(wait), 25))
-                    continue
-
-                if resp.status_code == 200:
-                    content_type = resp.headers.get("content-type", "").split(";")[0].strip()
-
-                    # Raw image bytes
-                    if content_type.startswith("image/"):
-                        img_b64  = base64.b64encode(resp.content).decode("utf-8")
-                        data_url = f"data:{content_type};base64,{img_b64}"
-                        logger.info(f"/generate-image  success (raw)  size={len(resp.content)//1024}KB")
-                        return ImageGenResponse(image_url=data_url, prompt_used=refined_prompt)
-
-                    # JSON response (fal-ai returns {"images": [{"url": "..."}]} or base64)
-                    try:
-                        j = resp.json()
-                        # fal-ai format: {"images": [{"url": "data:image/...;base64,..."}]}
-                        images = j.get("images") or j.get("data") or []
-                        if isinstance(images, list) and images:
-                            img = images[0]
-                            url = img.get("url") or img.get("image") or img.get("b64_json") or ""
-                            if url.startswith("data:"):
-                                logger.info(f"/generate-image  success (fal-ai data url)")
-                                return ImageGenResponse(image_url=url, prompt_used=refined_prompt)
-                            if url.startswith("http"):
-                                # fetch the actual image
-                                img_resp = await c.get(url)
-                                img_b64  = base64.b64encode(img_resp.content).decode("utf-8")
-                                data_url = f"data:image/jpeg;base64,{img_b64}"
-                                logger.info(f"/generate-image  success (fal-ai url fetch)")
-                                return ImageGenResponse(image_url=data_url, prompt_used=refined_prompt)
-                        # plain base64 field
-                        b64 = j.get("image") or j.get("b64_json")
-                        if b64:
-                            data_url = f"data:image/jpeg;base64,{b64}"
-                            return ImageGenResponse(image_url=data_url, prompt_used=refined_prompt)
-                    except Exception as parse_err:
-                        logger.warning(f"/generate-image  parse error: {parse_err}")
-
-                    last_error = f"Unexpected response: {resp.text[:200]}"
-                    await asyncio.sleep(5)
-                    continue
-
-                last_error = f"HuggingFace HTTP {resp.status_code}: {resp.text[:200]}"
-                await asyncio.sleep(5)
-
-        except httpx.TimeoutException:
-            last_error = f"Request timed out on attempt {attempt+1}"
-            await asyncio.sleep(5)
-        except Exception as e:
-            last_error = str(e)
-            logger.error(f"/generate-image  attempt={attempt+1}  error={e}")
-            await asyncio.sleep(3)
-
-    raise HTTPException(status_code=502, detail=f"Image generation failed: {last_error}")
