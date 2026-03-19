@@ -191,9 +191,29 @@ RULES:
    - "explain more" → "Explain [the last topic discussed] in more detail"
    - "make it harder" after a quiz → "Make the quiz on [last topic] harder"
    - "same but for china" → "Show the same [graph/data] for China"
-4. If the message is very short or a single word, ALWAYS expand it using context
-5. If the message references "it", "this", "that", "same", "above" — replace with the actual subject
-6. Preserve the student's intent — don't change what they're asking for, just make it complete
+
+4. PDF & DOCUMENT CONTEXT (very important):
+   - If the history contains a PDF explanation, summary, or Q&A, treat that document as the active topic.
+   - "make notes on it" after a PDF explanation → "Make study notes on [PDF topic, e.g. Light: Shadows and Reflections]"
+   - "make a flowchart" after a PDF explanation → "Make a flowchart for [PDF topic, e.g. Light: Shadows and Reflections]"
+   - "make flashcards" after a PDF → "Make flashcards on [PDF topic]"
+   - "quiz me" after a PDF → "Quiz me on [PDF topic]"
+   - "summarise it" after a PDF → "Summarise [PDF topic/document name]"
+   - "explain more" after a PDF → "Explain [specific section of PDF topic] in more detail"
+   - Always extract the actual subject/topic name from the PDF content in history — never leave it as "it" or "this"
+
+5. TOPIC MEMORY — always carry the last known topic forward:
+   - "explain more" → "Explain [last topic] in more detail"
+   - "give an example" → "Give an example of [last concept discussed]"
+   - "make it simpler" → "Explain [last topic] in simpler terms"
+   - "what about X" → "How does X relate to [last topic]?"
+   - "notes on it" / "notes on this" → "Make study notes on [last topic from history]"
+   - "flowchart of it" / "flowchart on this" → "Make a flowchart of [last topic from history]"
+   - Short follow-ups like "and?" / "more?" / "continue" → "Continue explaining [last topic]"
+
+6. If the message is very short or a single word, ALWAYS expand it using context
+7. If the message references "it", "this", "that", "same", "above" — ALWAYS replace with the actual subject from history
+8. Preserve the student's intent — don't change what they're asking for, just make it complete and specific
 
 Output ONLY the refined message. No explanation, no preamble, no quotes around it."""
 
@@ -322,10 +342,19 @@ notes     = wants structured study notes, revision notes, a summary in note form
 formula   = wants a formula sheet, key terms, definitions list, cheat sheet, or terminology reference
 flowchart = user asks for a flowchart, flow diagram, process diagram, diagram of a process, "diagram of X",
             "draw the steps of X", "flowchart for X", "how does X work as a diagram", "show me the process of X",
-            "map out X", "chart the steps", "draw X process". Trigger even without the word "flowchart" if the
+            "map out X", "chart the steps", "draw X process", or just "make a flowchart" / "flowchart" as a
+            follow-up after any previous explanation or PDF. Trigger even without the word "flowchart" if the
             user clearly wants a visual step-by-step process diagram.
 chat      = everything else — explanations, questions, math problems, coding, "write answer", "explain", "solve",
             "what is", "how does", general conversation
+
+CONTEXT-AWARE FOLLOW-UP RULES (use conversation history to classify short messages):
+- "make notes on it" / "notes on this" / "make some notes" after ANY topic or PDF → notes
+- "make a flowchart" / "flowchart" / "flowchart of it" after ANY topic or PDF → flowchart
+- "make flashcards" / "flashcards on it" after ANY topic or PDF → flashcard
+- "quiz me" / "quiz me on it" / "test me" after ANY topic or PDF → quiz
+- "formula sheet" / "key terms" / "cheat sheet" after ANY topic or PDF → formula
+- Short follow-ups that reference a previous topic should inherit intent from the request type
 
 CRITICAL:
 - If the user asks a math question, wants an explanation, says "write answer", "solve this" — output: chat
@@ -333,6 +362,7 @@ CRITICAL:
 - Only output "flowchart" if the user wants a visual process/flow diagram
 - Infer "notes" and "formula" from context and intent, not just keywords
 - When unsure between notes/chat, prefer notes if it seems like a study/revision request
+- A bare "make a flowchart" with no other context still means: flowchart
 
 No punctuation, no explanation. One word only."""
 
@@ -681,8 +711,8 @@ async def refine_prompt(message: str, history: list[HistoryEntry],
     history_snippet = ""
     if history:
         lines = [
-            f"{'Student' if e.role=='user' else 'Tutor'}: {e.content[:400]}"
-            for e in history[-20:]
+            f"{'Student' if e.role=='user' else 'Tutor'}: {e.content[:600]}"
+            for e in history[-30:]
         ]
         history_snippet = "\n".join(lines)
 
