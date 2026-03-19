@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from groq import Groq
 import json
 import os
@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(me
 logger = logging.getLogger("sedy")
 
 # ── App ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Sedy API", version="3.4.0")
+app = FastAPI(title="Sedy API", version="3.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,43 +32,37 @@ client = Groq(api_key=GROQ_API_KEY)
 
 # ── Available models ───────────────────────────────────────────────────────────
 MODELS = {
-    "pro":   "llama-3.3-70b-versatile",        # Sedy Pro   — best quality, complex reasoning
-    "flash": "llama-3.1-8b-instant",            # Sedy Flash — fastest, lightweight tasks
-    "smart": "qwen/qwen3-32b",                  # Sedy Smart — reasoning, JSON, multilingual
-    "code":  "deepseek-r1-distill-qwen-32b",    # internal code model — best coding on Groq
+    "pro":   "llama-3.3-70b-versatile",
+    "flash": "llama-3.1-8b-instant",
+    "smart": "qwen/qwen3-32b",
+    "code":  "deepseek-r1-distill-qwen-32b",
 }
 
-# Models that do NOT support a system role (none currently)
 NO_SYSTEM_ROLE_MODELS: set[str] = set()
 DEFAULT_MODEL = MODELS["pro"]
 
-# Auto-select: pick best model for each task type
 AUTO_MODEL_MAP = {
-    "chat":       MODELS["pro"],    # complex explanations → best model
-    "pdf":        MODELS["pro"],    # PDF reading/summarising → best context understanding
-    "code":       MODELS["code"],   # coding → deepseek best coding model on Groq
-    "notes":      MODELS["pro"],    # notes generation → best quality
-    "formula":    MODELS["smart"],  # structured reference sheet → Qwen3 excels
-    "flashcard":  MODELS["smart"],  # structured JSON output → Qwen3 excels
-    "quiz":       MODELS["smart"],  # structured JSON output → Qwen3 excels
-    "graph":      MODELS["smart"],  # JSON chart data → Qwen3 excels
-    "intent":     MODELS["flash"],  # single-word classification → fastest
-    "refine":     MODELS["flash"],  # prompt cleanup → simple task, fast
+    "chat":       MODELS["pro"],
+    "pdf":        MODELS["pro"],
+    "code":       MODELS["code"],
+    "notes":      MODELS["pro"],
+    "formula":    MODELS["smart"],
+    "flashcard":  MODELS["smart"],
+    "quiz":       MODELS["smart"],
+    "graph":      MODELS["smart"],
+    "flowchart":  MODELS["smart"],
+    "intent":     MODELS["flash"],
+    "refine":     MODELS["flash"],
 }
 
 def resolve_model(requested: str | None, task: str = "chat") -> str:
-    """
-    requested: 'auto' | 'pro' | 'flash' | 'smart' | None
-    task:      one of the AUTO_MODEL_MAP keys
-    Returns the actual model string to use.
-    """
     if not requested or requested == "auto":
         return AUTO_MODEL_MAP.get(task, DEFAULT_MODEL)
     return MODELS.get(requested, DEFAULT_MODEL)
 
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 
-# ── PDF library (prefer pypdf, fall back to pdfplumber, then pymupdf) ──────────
+# ── PDF library ────────────────────────────────────────────────────────────────
 PDF_ENGINE = None
 try:
     from pypdf import PdfReader as _PyPdfReader
@@ -81,7 +75,7 @@ except ImportError:
         logger.info("PDF engine: pdfplumber")
     except ImportError:
         try:
-            import fitz  # PyMuPDF
+            import fitz
             PDF_ENGINE = "pymupdf"
             logger.info("PDF engine: pymupdf")
         except ImportError:
@@ -89,7 +83,6 @@ except ImportError:
 
 
 def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, int]:
-    """Return (full_text, page_count). Raises RuntimeError if no engine."""
     if PDF_ENGINE == "pypdf":
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -127,7 +120,7 @@ def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, int]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── SYSTEM PROMPTS ────────────────────────────────────────────────────────────
+# ── SYSTEM PROMPTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 SYSTEM_PROMPT = """You are Sedy, an intelligent student learning assistant made by Ansh Verma, a school student.
@@ -209,6 +202,68 @@ DATA RULES:
 - Time series: 8-20 points. Pie: 3-8 slices. Bar: 3-10 groups.
 - Use realistic historically plausible data."""
 
+FLOWCHART_SYSTEM_PROMPT = """You are a flowchart layout engine for a student learning app. Output ONLY a single valid JSON object. No prose, no markdown fences, no explanation.
+
+SCHEMA:
+{
+  "title": "Short title (max 50 chars)",
+  "nodes": [
+    {
+      "id": "unique_snake_case_id",
+      "label": "Short label (max 30 chars, use \\n for line break if needed)",
+      "sub": "Optional subtitle max 25 chars",
+      "shape": "oval | rect | diamond | para",
+      "col": "gray | blue | teal | amber | green | coral | purple",
+      "x": 280,
+      "y": 40
+    }
+  ],
+  "edges": [
+    {
+      "f": "from_node_id",
+      "t": "to_node_id",
+      "label": "Yes / No / short label (optional, max 10 chars)",
+      "back": false,
+      "bx": 500
+    }
+  ]
+}
+
+SHAPE RULES:
+- oval   → start and end nodes ONLY
+- rect   → regular process steps
+- diamond → decision / condition nodes (always have Yes/No branches)
+- para   → input / output operations (user input, data output)
+
+COLOR RULES:
+- gray   → start and end ovals
+- blue   → input / data / lookup steps
+- teal   → processing / transformation steps
+- amber  → decisions (ALL diamond nodes must be amber)
+- green  → success / positive outcome
+- coral  → error / failure / rejection path
+- purple → complex internal logic / sub-process
+
+LAYOUT RULES (CRITICAL — the frontend renders nodes at exact x,y pixel positions):
+- Canvas is 680px wide. Keep all node x values between 20 and 520 (node width = 140px, so right edge = x+140).
+- Main flow goes top-to-bottom with ~100px vertical spacing between node centers.
+- Branch left for No/error paths: use x around 60-100
+- Branch right for Yes/alternate paths or parallel flows: use x around 420-480
+- Center (main flow) x should be around 250-280
+- Decision nodes branch: one child directly below (same x), one child to the left or right
+- back edges (loop-backs): set "back": true and provide "bx" — the x coordinate of the waypoint for the return arrow. Use bx < 20 for left-side loops, bx > 540 for right-side loops.
+- Nodes must NOT overlap: minimum 80px vertical gap between nodes at the same x column; minimum 160px horizontal gap between nodes at the same y row.
+- Start with y=40 for the first node. Increment y by 90-110 for each level.
+- For branching: branch children start at the same y as each other, positioned left/right of center.
+
+LABEL RULES:
+- Labels must be plain text — no markdown, no LaTeX, no special symbols except standard math (², ³, ÷, ≤, ≥, ≠, →)
+- Use \\n to break long labels into 2 lines
+- Keep labels SHORT — the box is only 140px wide
+- edge labels: only "Yes", "No", or a very short phrase (max 10 chars)
+
+OUTPUT ONLY THE JSON. Nothing else."""
+
 PDF_SYSTEM_PROMPT = """You are Sedy, an intelligent student learning assistant made by Ansh Verma.
 The user has uploaded a PDF whose FULL TEXT is embedded below between === DOCUMENT START === and === DOCUMENT END ===.
 
@@ -221,19 +276,25 @@ YOUR RULES:
 6. Be thorough — do NOT give short or vague answers. Students need real detail."""
 
 INTENT_SYSTEM_PROMPT = """You are an intent classifier for a student learning app.
-Output EXACTLY one word from: graph, flashcard, quiz, both, notes, formula, chat
+Output EXACTLY one word from: graph, flashcard, quiz, both, notes, formula, flowchart, chat
 
-graph     = user EXPLICITLY asks for a chart, graph, plot, bar chart, pie chart, line graph, or data visualisation. NEVER classify as graph just because the topic involves numbers, sequences, steps, or data.
+graph     = user EXPLICITLY asks for a chart, graph, plot, bar chart, pie chart, line graph, or data visualisation.
 flashcard = wants flip study cards
 quiz      = wants MCQ quiz
 both      = wants flashcards AND a quiz
-notes     = wants structured study notes, revision notes, a summary in note form, key points as notes — infer from context even without keyword "notes". E.g. "summarise X for revision", "make me notes", "I need to study X tonight", "give me a study sheet on X"
-formula   = wants a formula sheet, key terms, definitions list, cheat sheet, or terminology reference — even without the word "formula". E.g. "what are the key terms in X", "give me all definitions", "important terms in X", "cheat sheet for X"
-chat      = everything else — explanations, questions, math problems, coding, "write answer", "explain", "solve", "what is", "how does", general conversation
+notes     = wants structured study notes, revision notes, a summary in note form, key points as notes
+formula   = wants a formula sheet, key terms, definitions list, cheat sheet, or terminology reference
+flowchart = user asks for a flowchart, flow diagram, process diagram, diagram of a process, "diagram of X",
+            "draw the steps of X", "flowchart for X", "how does X work as a diagram", "show me the process of X",
+            "map out X", "chart the steps", "draw X process". Trigger even without the word "flowchart" if the
+            user clearly wants a visual step-by-step process diagram.
+chat      = everything else — explanations, questions, math problems, coding, "write answer", "explain", "solve",
+            "what is", "how does", general conversation
 
 CRITICAL:
 - If the user asks a math question, wants an explanation, says "write answer", "solve this" — output: chat
-- Only output "graph" if the user literally asks for a chart or visualisation
+- Only output "graph" if the user literally asks for a chart or visualisation of data
+- Only output "flowchart" if the user wants a visual process/flow diagram
 - Infer "notes" and "formula" from context and intent, not just keywords
 - When unsure between notes/chat, prefer notes if it seems like a study/revision request
 
@@ -269,7 +330,7 @@ FORMAT RULES:
 
 3. Cover EVERY important formula and term — do not skip any
 4. Order from basic to advanced within each section
-5. If it is a non-math topic (history, biology etc), focus on key terms, dates, names, and concepts instead of formulas
+5. If it is a non-math topic (history, biology etc), focus on key terms, dates, names, and concepts
 
 Do NOT add preamble. Start directly with the ## heading."""
 
@@ -293,9 +354,8 @@ FORMAT:
 ]"""
 
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# ── PYDANTIC MODELS ───────────────────────────────────────────────────────────
+# ── PYDANTIC MODELS
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HistoryEntry(BaseModel):
@@ -333,7 +393,55 @@ class PdfChatRequest(BaseModel):
     history: list[HistoryEntry] = []
     model: str = "auto"
 
+class NotesRequest(BaseModel):
+    topic: str
+    history: list[HistoryEntry] = []
+    model: str = "auto"
+    pdf_base64: str = ""
+    pdf_name: str = ""
 
+class FormulaRequest(BaseModel):
+    topic: str
+    history: list[HistoryEntry] = []
+    model: str = "auto"
+    pdf_base64: str = ""
+    pdf_name: str = ""
+
+class IntentRequest(BaseModel):
+    message: str
+    history: list[HistoryEntry] = []
+
+class CodeQuestionsRequest(BaseModel):
+    message: str
+
+# ── Flowchart models ───────────────────────────────────────────────────────────
+class FlowchartRequest(BaseModel):
+    message: str
+    history: list[HistoryEntry] = []
+    model: str = "auto"
+
+class FlowchartNode(BaseModel):
+    id: str
+    label: str
+    sub: str = ""
+    shape: str = "rect"   # oval | rect | diamond | para
+    col: str = "blue"     # gray | blue | teal | amber | green | coral | purple
+    x: float = 0
+    y: float = 0
+
+class FlowchartEdge(BaseModel):
+    f: str          # from node id
+    t: str          # to node id
+    label: str = ""
+    back: bool = False
+    bx: float = 0   # waypoint x for back-edges
+
+class FlowchartResponse(BaseModel):
+    title: str
+    nodes: list[FlowchartNode]
+    edges: list[FlowchartEdge]
+
+# ── Response models ────────────────────────────────────────────────────────────
 class ChatResponse(BaseModel):
     reply: str
 
@@ -377,37 +485,16 @@ class PdfChatResponse(BaseModel):
     reply: str
     pdf_name: str
 
-class NotesRequest(BaseModel):
-    topic: str
-    history: list[HistoryEntry] = []
-    model: str = "auto"
-    pdf_base64: str = ""
-    pdf_name: str = ""
-
 class NotesResponse(BaseModel):
     notes: str
     topic: str
-
-class FormulaRequest(BaseModel):
-    topic: str
-    history: list[HistoryEntry] = []
-    model: str = "auto"
-    pdf_base64: str = ""
-    pdf_name: str = ""
 
 class FormulaResponse(BaseModel):
     sheet: str
     topic: str
 
-class IntentRequest(BaseModel):
-    message: str
-    history: list[HistoryEntry] = []
-
 class IntentResponse(BaseModel):
     intent: str
-
-class CodeQuestionsRequest(BaseModel):
-    message: str
 
 class CodeQuestion(BaseModel):
     question: str
@@ -417,18 +504,11 @@ class CodeQuestionsResponse(BaseModel):
     questions: list[CodeQuestion]
 
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# ── HELPERS ───────────────────────────────────────────────────────────────────
+# ── HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_rate_limit_error(exc: Exception) -> dict | None:
-    """
-    If exc is a Groq 429 rate-limit error, return:
-      { "type": "rate_limit", "wait_seconds": int, "wait_display": "17m 35s",
-        "limit_type": "TPD" | "TPM" | "RPM", "used": int, "limit": int }
-    Otherwise return None.
-    """
     import re as _re
     msg = str(exc)
     if "429" not in msg and "rate_limit" not in msg.lower():
@@ -440,7 +520,6 @@ def parse_rate_limit_error(exc: Exception) -> dict | None:
     if m:
         raw = m.group(1).strip()
         wait_str = raw
-        # parse "17m35.808s" or "2h 3m 10s" or "45.5s"
         hours   = sum(float(x) for x in _re.findall(r'([\d.]+)h', raw))
         minutes = sum(float(x) for x in _re.findall(r'([\d.]+)m', raw))
         seconds = sum(float(x) for x in _re.findall(r'([\d.]+)s', raw))
@@ -487,7 +566,6 @@ def build_messages(system: str, history: list[HistoryEntry], user_message: str) 
 
 
 def strip_think_tags(raw: str) -> str:
-    """Remove Qwen3 <think>...</think> reasoning tokens from output."""
     return re.sub(r'<think>[\s\S]*?</think>', '', raw).strip()
 
 
@@ -558,7 +636,6 @@ async def refine_prompt(message: str, history: list[HistoryEntry],
     if not message or not message.strip():
         return message
 
-    # Skip refinement for long, clearly complete messages (saves tokens)
     msg = message.strip()
     if len(msg) > 200 and ' ' in msg and not any(
         vague in msg.lower() for vague in ['in inr', 'in usd', 'same for', 'make it', 'show it', 'as graph', 'grph']
@@ -567,7 +644,6 @@ async def refine_prompt(message: str, history: list[HistoryEntry],
 
     history_snippet = ""
     if history:
-        # Include last 20 entries, with more content per entry for context
         lines = [
             f"{'Student' if e.role=='user' else 'Tutor'}: {e.content[:400]}"
             for e in history[-20:]
@@ -598,8 +674,6 @@ async def refine_graph_prompt(message: str, history: list[HistoryEntry]) -> str:
     return await refine_prompt(message, history, system_prompt=GRAPH_REFINE_SYSTEM_PROMPT)
 
 
-
-
 async def fetch_live_data(query: str) -> str:
     if not SERPER_API_KEY:
         return ""
@@ -624,20 +698,20 @@ async def fetch_live_data(query: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── ROUTES ────────────────────────────────────────────────────────════════════
+# ── ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/")
 async def root():
     return {
         "status": "Sedy API is live 🚀",
-        "version": "3.4.0",
-        "model": MODEL,
+        "version": "3.5.0",
         "pdf_engine": PDF_ENGINE or "none — install pypdf!",
         "live_data": bool(SERPER_API_KEY),
-        "image_gen": "huggingface FLUX.1-schnell (free)",
-        "endpoints": ["/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat",
-                      "/intent", "/code-questions", "/notes", "/formula-sheet"],
+        "endpoints": [
+            "/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat",
+            "/intent", "/code-questions", "/notes", "/formula-sheet", "/flowchart"
+        ],
     }
 
 
@@ -661,7 +735,8 @@ async def detect_intent(req: IntentRequest):
             max_tokens=5, temperature=0.0,
         )
         raw    = response.choices[0].message.content.strip().lower()
-        intent = raw if raw in ("graph", "flashcard", "quiz", "both", "image", "chat") else "chat"
+        valid  = ("graph", "flashcard", "quiz", "both", "notes", "formula", "flowchart", "chat")
+        intent = raw if raw in valid else "chat"
         logger.info(f"/intent  result={intent!r}")
         return IntentResponse(intent=intent)
     except Exception as e:
@@ -705,8 +780,7 @@ async def flashcards(req: FlashcardRequest):
     topic = resolve_topic_from_history(topic, req.history)
     if not topic:
         raise HTTPException(status_code=400, detail="topic must not be empty")
-    # count == 0  →  AI decides how many cards are needed
-    # count  > 0  →  honour exactly (up to 50)
+
     auto_count = req.count == 0
     count = max(1, min(req.count, 50)) if not auto_count else 0
 
@@ -771,8 +845,6 @@ async def quiz(req: QuizRequest):
         raise HTTPException(status_code=400, detail="topic must not be empty")
     difficulty = req.difficulty if req.difficulty in ("easy", "medium", "hard") else "medium"
 
-    # count == 0  →  AI decides how many questions are needed
-    # count  > 0  →  honour exactly (up to 50)
     auto_count = req.count == 0
     count = max(1, min(req.count, 50)) if not auto_count else 0
 
@@ -904,26 +976,21 @@ async def pdf_chat(req: PdfChatRequest):
     pdf_name = req.pdf_name.strip() or "document.pdf"
     logger.info(f"/pdf-chat  model={model}  file={pdf_name!r}  msg={req.message[:80]!r}")
 
-    # ── 1. Decode base64 ────────────────────────────────────────────────────────
-    # Strip data-URL prefix if the client accidentally sent it
     raw_b64 = req.pdf_base64
     if "," in raw_b64:
         raw_b64 = raw_b64.split(",", 1)[1]
-    # Remove whitespace that some clients insert
     raw_b64 = raw_b64.strip().replace("\n", "").replace("\r", "").replace(" ", "")
     try:
         pdf_bytes = base64.b64decode(raw_b64)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid base64 PDF data: {exc}")
 
-    # Sanity-check magic bytes
     if not pdf_bytes.startswith(b"%PDF"):
         raise HTTPException(
             status_code=400,
             detail="The uploaded file does not appear to be a valid PDF (missing %PDF header).",
         )
 
-    # ── 2. Extract text ─────────────────────────────────────────────────────────
     try:
         pdf_text, page_count = extract_pdf_text(pdf_bytes)
         logger.info(f"/pdf-chat  {len(pdf_text)} chars from {page_count} pages  engine={PDF_ENGINE}")
@@ -941,8 +1008,6 @@ async def pdf_chat(req: PdfChatRequest):
             ),
         )
 
-    # ── 3. Smart truncation — keep as much text as possible ────────────────────
-    # llama-3.3-70b on Groq supports large context; 80k chars is safe.
     MAX_PDF_CHARS = 80_000
     truncation_note = ""
     original_len = len(pdf_text)
@@ -953,17 +1018,14 @@ async def pdf_chat(req: PdfChatRequest):
             f"Later pages may not be shown.]"
         )
 
-    # ── 4. Build messages ───────────────────────────────────────────────────────
     refined_message = await refine_prompt(req.message, req.history)
 
-    # Document text in system prompt = model treats it as ground-truth context
     doc_block = (
         f'\n\nDOCUMENT: "{pdf_name}" ({page_count} pages)\n'
         f"=== DOCUMENT START ===\n{pdf_text}{truncation_note}\n=== DOCUMENT END ==="
     )
     messages: list[dict] = [{"role": "system", "content": PDF_SYSTEM_PROMPT + doc_block}]
 
-    # Keep last 6 turns for multi-turn PDF conversation
     sanitised: list[dict] = []
     for entry in req.history[-6:]:
         role = entry.role if entry.role in ("user", "assistant") else "user"
@@ -974,7 +1036,6 @@ async def pdf_chat(req: PdfChatRequest):
     messages.extend(sanitised)
     messages.append({"role": "user", "content": refined_message})
 
-    # ── 5. Call LLM — bigger budget + lower temp for document-grounded answers ──
     try:
         response = client.chat.completions.create(
             model=model,
@@ -1037,6 +1098,7 @@ async def code_questions(req: CodeQuestionsRequest):
         logger.warning(f"/code-questions  parse failed: {e}  raw={raw[:200]!r}")
         return CodeQuestionsResponse(questions=[])
 
+
 # ── /notes ─────────────────────────────────────────────────────────────────────
 
 @app.post("/notes", response_model=NotesResponse)
@@ -1048,7 +1110,6 @@ async def generate_notes(req: NotesRequest):
     if not topic:
         raise HTTPException(status_code=400, detail="topic must not be empty")
 
-    # If a PDF was provided, use its content as the source
     if req.pdf_base64:
         try:
             raw_b64   = req.pdf_base64.split(",", 1)[1] if "," in req.pdf_base64 else req.pdf_base64
@@ -1098,7 +1159,6 @@ async def formula_sheet(req: FormulaRequest):
     if not topic:
         raise HTTPException(status_code=400, detail="topic must not be empty")
 
-    # If a PDF was provided, use its content as the source
     if req.pdf_base64:
         try:
             raw_b64   = req.pdf_base64.split(",", 1)[1] if "," in req.pdf_base64 else req.pdf_base64
@@ -1135,3 +1195,88 @@ async def formula_sheet(req: FormulaRequest):
     sheet = strip_think_tags(response.choices[0].message.content.strip())
     logger.info(f"/formula-sheet  reply_len={len(sheet)}")
     return FormulaResponse(sheet=sheet, topic=topic)
+
+
+# ── /flowchart ─────────────────────────────────────────────────────────────────
+
+@app.post("/flowchart", response_model=FlowchartResponse)
+async def flowchart(req: FlowchartRequest):
+    model = resolve_model(req.model, "flowchart")
+    logger.info(f"/flowchart  model={model}  msg={req.message[:80]!r}")
+
+    # Refine the message using conversation history
+    refined = await refine_prompt(req.message, req.history)
+
+    user_prompt = f"Create a flowchart for: {refined}"
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": FLOWCHART_SYSTEM_PROMPT},
+                {"role": "user",   "content": user_prompt},
+            ],
+            max_tokens=4096,
+            temperature=0.2,
+        )
+    except Exception as e:
+        logger.error(f"Groq error /flowchart: {e}")
+        rl = parse_rate_limit_error(e)
+        if rl:
+            raise HTTPException(status_code=429, detail=rl)
+        raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
+
+    raw = strip_json_fences(response.choices[0].message.content.strip())
+
+    try:
+        obj = json.loads(raw)
+
+        nodes = []
+        for n in obj.get("nodes", []):
+            if not isinstance(n, dict):
+                continue
+            # Validate and clamp x/y so nodes always stay on canvas
+            x = max(20, min(float(n.get("x", 280)), 520))
+            y = max(20, float(n.get("y", 40)))
+            nodes.append(FlowchartNode(
+                id    = str(n.get("id", f"node_{len(nodes)}")),
+                label = str(n.get("label", "Step"))[:50],
+                sub   = str(n.get("sub", ""))[:30],
+                shape = n.get("shape", "rect") if n.get("shape") in ("oval","rect","diamond","para") else "rect",
+                col   = n.get("col", "blue") if n.get("col") in ("gray","blue","teal","amber","green","coral","purple") else "blue",
+                x     = x,
+                y     = y,
+            ))
+
+        edges = []
+        node_ids = {n.id for n in nodes}
+        for e in obj.get("edges", []):
+            if not isinstance(e, dict):
+                continue
+            f_id = str(e.get("f", ""))
+            t_id = str(e.get("t", ""))
+            # Only include edges where both nodes exist
+            if f_id not in node_ids or t_id not in node_ids:
+                logger.warning(f"/flowchart  skipping edge {f_id}→{t_id} — node not found")
+                continue
+            edges.append(FlowchartEdge(
+                f     = f_id,
+                t     = t_id,
+                label = str(e.get("label", ""))[:15],
+                back  = bool(e.get("back", False)),
+                bx    = float(e.get("bx", 0)),
+            ))
+
+        if not nodes:
+            raise ValueError("No valid nodes in flowchart response")
+
+        logger.info(f"/flowchart  title={obj.get('title','')!r}  nodes={len(nodes)}  edges={len(edges)}")
+        return FlowchartResponse(
+            title = str(obj.get("title", refined[:50])),
+            nodes = nodes,
+            edges = edges,
+        )
+
+    except Exception as e:
+        logger.warning(f"/flowchart  parse failed: {e}  raw={raw[:400]!r}")
+        raise HTTPException(status_code=422, detail=f"Could not parse flowchart data: {e}")
