@@ -47,6 +47,8 @@ AUTO_MODEL_MAP = {
     "chat":       MODELS["pro"],    # complex explanations → best model
     "pdf":        MODELS["pro"],    # PDF reading/summarising → best context understanding
     "code":       MODELS["code"],   # coding → deepseek best coding model on Groq
+    "notes":      MODELS["pro"],    # notes generation → best quality
+    "formula":    MODELS["smart"],  # structured reference sheet → Qwen3 excels
     "flashcard":  MODELS["smart"],  # structured JSON output → Qwen3 excels
     "quiz":       MODELS["smart"],  # structured JSON output → Qwen3 excels
     "graph":      MODELS["smart"],  # JSON chart data → Qwen3 excels
@@ -219,19 +221,57 @@ YOUR RULES:
 6. Be thorough — do NOT give short or vague answers. Students need real detail."""
 
 INTENT_SYSTEM_PROMPT = """You are an intent classifier for a student learning app.
-Output EXACTLY one word from: graph, flashcard, quiz, both, chat, image
+Output EXACTLY one word from: graph, flashcard, quiz, both, notes, formula, chat
 
 graph     = user EXPLICITLY asks for a chart, graph, plot, bar chart, pie chart, line graph, or data visualisation. NEVER classify as graph just because the topic involves numbers, sequences, steps, or data.
 flashcard = wants flip study cards
 quiz      = wants MCQ quiz
 both      = wants flashcards AND a quiz
-image     = wants an AI-generated image/picture/illustration/artwork
-chat      = everything else — explanations, questions, math problems, coding, definitions, "write answer", "explain", "solve", "what is", "how does" etc.
+notes     = wants structured study notes, revision notes, a summary in note form, key points as notes — infer from context even without keyword "notes". E.g. "summarise X for revision", "make me notes", "I need to study X tonight", "give me a study sheet on X"
+formula   = wants a formula sheet, key terms, definitions list, cheat sheet, or terminology reference — even without the word "formula". E.g. "what are the key terms in X", "give me all definitions", "important terms in X", "cheat sheet for X"
+chat      = everything else — explanations, questions, math problems, coding, "write answer", "explain", "solve", "what is", "how does", general conversation
 
-CRITICAL: If the user asks a math question, wants an explanation, says "write answer", "solve this", or describes a problem — output: chat
-Only output "graph" if the user literally asks for a chart or visualisation.
+CRITICAL:
+- If the user asks a math question, wants an explanation, says "write answer", "solve this" — output: chat
+- Only output "graph" if the user literally asks for a chart or visualisation
+- Infer "notes" and "formula" from context and intent, not just keywords
+- When unsure between notes/chat, prefer notes if it seems like a study/revision request
 
 No punctuation, no explanation. One word only."""
+
+NOTES_SYSTEM_PROMPT = """You are Sedy, an expert study notes writer for students made by Ansh Verma.
+Generate comprehensive, well-structured study notes on the given topic.
+
+FORMAT RULES:
+1. Start with a one-line topic title as ## heading
+2. Use ## for major sections, ### for sub-sections
+3. Use bullet points (- ) for key facts under each section
+4. Bold (**term**) all key terms when first introduced
+5. Use LaTeX for ALL math: $...$ inline, $$...$$ display
+6. End with a ## Key Takeaways section with 4-6 bullet points
+7. Be comprehensive — cover ALL important aspects of the topic
+8. Write for a student who needs to revise efficiently — clear, concise, complete
+
+Do NOT add preamble like "Here are your notes". Start directly with the ## heading."""
+
+FORMULA_SYSTEM_PROMPT = """You are Sedy, an expert at creating formula and key terms reference sheets for students made by Ansh Verma.
+Generate a complete reference sheet for the given topic.
+
+FORMAT RULES:
+1. Start with ## [Topic] — Formula & Key Terms Sheet
+2. Split into two sections:
+   ### 📐 Formulas & Equations
+   - Each formula on its own line: **Name**: $formula$ — brief explanation
+   - Use LaTeX for ALL math: $...$ inline, $$...$$ display
+
+   ### 📖 Key Terms & Definitions
+   - Each term: **Term** — clear, concise definition (1-2 sentences)
+
+3. Cover EVERY important formula and term — do not skip any
+4. Order from basic to advanced within each section
+5. If it is a non-math topic (history, biology etc), focus on key terms, dates, names, and concepts instead of formulas
+
+Do NOT add preamble. Start directly with the ## heading."""
 
 CODE_QUESTIONS_PROMPT = """You are helping clarify a coding request before writing code.
 The user has asked: "{request}"
@@ -336,6 +376,28 @@ class GraphResponse(BaseModel):
 class PdfChatResponse(BaseModel):
     reply: str
     pdf_name: str
+
+class NotesRequest(BaseModel):
+    topic: str
+    history: list[HistoryEntry] = []
+    model: str = "auto"
+    pdf_base64: str = ""
+    pdf_name: str = ""
+
+class NotesResponse(BaseModel):
+    notes: str
+    topic: str
+
+class FormulaRequest(BaseModel):
+    topic: str
+    history: list[HistoryEntry] = []
+    model: str = "auto"
+    pdf_base64: str = ""
+    pdf_name: str = ""
+
+class FormulaResponse(BaseModel):
+    sheet: str
+    topic: str
 
 class IntentRequest(BaseModel):
     message: str
@@ -575,7 +637,7 @@ async def root():
         "live_data": bool(SERPER_API_KEY),
         "image_gen": "huggingface FLUX.1-schnell (free)",
         "endpoints": ["/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat",
-                      "/intent", "/code-questions"],
+                      "/intent", "/code-questions", "/notes", "/formula-sheet"],
     }
 
 
@@ -974,3 +1036,102 @@ async def code_questions(req: CodeQuestionsRequest):
     except Exception as e:
         logger.warning(f"/code-questions  parse failed: {e}  raw={raw[:200]!r}")
         return CodeQuestionsResponse(questions=[])
+
+# ── /notes ─────────────────────────────────────────────────────────────────────
+
+@app.post("/notes", response_model=NotesResponse)
+async def generate_notes(req: NotesRequest):
+    model = resolve_model(req.model, "notes")
+    logger.info(f"/notes  model={model}  topic={req.topic!r}")
+
+    topic = req.topic.strip()
+    if not topic:
+        raise HTTPException(status_code=400, detail="topic must not be empty")
+
+    # If a PDF was provided, use its content as the source
+    if req.pdf_base64:
+        try:
+            raw_b64   = req.pdf_base64.split(",", 1)[1] if "," in req.pdf_base64 else req.pdf_base64
+            pdf_bytes = base64.b64decode(raw_b64.strip())
+            pdf_text, page_count = extract_pdf_text(pdf_bytes)
+            if len(pdf_text) > 60_000:
+                pdf_text = pdf_text[:60_000] + "\n\n[truncated]"
+            user_prompt = (
+                f'Generate comprehensive study notes on "{topic}" '
+                f'based on this document ({req.pdf_name}, {page_count} pages):\n\n{pdf_text}'
+            )
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Could not read PDF: {e}")
+    else:
+        user_prompt = f'Generate comprehensive study notes on: "{topic}"'
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": NOTES_SYSTEM_PROMPT},
+                {"role": "user",   "content": user_prompt},
+            ],
+            max_tokens=32768,
+            temperature=0.5,
+        )
+    except Exception as e:
+        logger.error(f"Groq error /notes: {e}")
+        rl = parse_rate_limit_error(e)
+        if rl:
+            raise HTTPException(status_code=429, detail=rl)
+        raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
+
+    notes = strip_think_tags(response.choices[0].message.content.strip())
+    logger.info(f"/notes  reply_len={len(notes)}")
+    return NotesResponse(notes=notes, topic=topic)
+
+
+# ── /formula-sheet ─────────────────────────────────────────────────────────────
+
+@app.post("/formula-sheet", response_model=FormulaResponse)
+async def formula_sheet(req: FormulaRequest):
+    model = resolve_model(req.model, "formula")
+    logger.info(f"/formula-sheet  model={model}  topic={req.topic!r}")
+
+    topic = req.topic.strip()
+    if not topic:
+        raise HTTPException(status_code=400, detail="topic must not be empty")
+
+    # If a PDF was provided, use its content as the source
+    if req.pdf_base64:
+        try:
+            raw_b64   = req.pdf_base64.split(",", 1)[1] if "," in req.pdf_base64 else req.pdf_base64
+            pdf_bytes = base64.b64decode(raw_b64.strip())
+            pdf_text, page_count = extract_pdf_text(pdf_bytes)
+            if len(pdf_text) > 60_000:
+                pdf_text = pdf_text[:60_000] + "\n\n[truncated]"
+            user_prompt = (
+                f'Generate a complete formula and key terms sheet for "{topic}" '
+                f'based on this document ({req.pdf_name}, {page_count} pages):\n\n{pdf_text}'
+            )
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Could not read PDF: {e}")
+    else:
+        user_prompt = f'Generate a complete formula and key terms reference sheet for: "{topic}"'
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": FORMULA_SYSTEM_PROMPT},
+                {"role": "user",   "content": user_prompt},
+            ],
+            max_tokens=32768,
+            temperature=0.3,
+        )
+    except Exception as e:
+        logger.error(f"Groq error /formula-sheet: {e}")
+        rl = parse_rate_limit_error(e)
+        if rl:
+            raise HTTPException(status_code=429, detail=rl)
+        raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
+
+    sheet = strip_think_tags(response.choices[0].message.content.strip())
+    logger.info(f"/formula-sheet  reply_len={len(sheet)}")
+    return FormulaResponse(sheet=sheet, topic=topic)
