@@ -146,21 +146,45 @@ STRICT MATH FORMATTING (frontend uses KaTeX):
 - NEVER write bare math like w^2 — always wrap in $w^2$
 - Fractions: $\\frac{a}{b}$  Subscripts: $A_{\\text{base}}$"""
 
-REFINE_SYSTEM_PROMPT = """You are a silent prompt refinement engine. Your ONLY job is to clean up a student's message.
-1. Fix spelling typos
-2. Fix grammar (keep casual tone)
-3. Resolve vague references ("it", "this", "that") using conversation history
+REFINE_SYSTEM_PROMPT = """You are a silent prompt refinement engine for a student AI assistant.
+Your job is to rewrite the student's message into a complete, self-contained, unambiguous request
+by using the conversation history as context.
 
-Output ONLY the refined message. No explanation, no preamble. If already perfect, output as-is."""
+RULES:
+1. Fix ALL spelling/typo errors (e.g. "grph" → "graph", "imnports" → "imports")
+2. Fix grammar while keeping casual tone
+3. CRITICAL — resolve ALL vague or incomplete references using history:
+   - "in inr" after a GDP graph → "Show India GDP from 2000 to 2024 as a line graph in INR (Indian Rupees)"
+   - "grph" after a table of data → "Show that data as a proper line graph"
+   - "write answer only" after a math problem → "Give only the final answer to x² + 5x + 6 = 0"
+   - "without any imports" after code → "Rewrite the snake game in Python without using any imports"
+   - "explain more" → "Explain [the last topic discussed] in more detail"
+   - "make it harder" after a quiz → "Make the quiz on [last topic] harder"
+   - "same but for china" → "Show the same [graph/data] for China"
+4. If the message is very short or a single word, ALWAYS expand it using context
+5. If the message references "it", "this", "that", "same", "above" — replace with the actual subject
+6. Preserve the student's intent — don't change what they're asking for, just make it complete
+
+Output ONLY the refined message. No explanation, no preamble, no quotes around it."""
 
 GRAPH_REFINE_SYSTEM_PROMPT = """You are a silent prompt refinement engine for data visualisation requests.
-1. Fix spelling/grammar
-2. Resolve vague references using conversation history
-3. Append chart type hint if strongly implied:
-   - "breakdown/share/proportion" → append "(pie chart)"
-   - "compare/vs/ranking/top N" → append "(bar chart)"
-   - "over time/trend/history" → append "(line chart)"
-Output ONLY the refined message."""
+Your job is to rewrite the user's message into a complete, self-contained graph request using history.
+
+RULES:
+1. Fix ALL spelling/typo errors (e.g. "grph" → "graph", "gdp of india" is fine)
+2. Resolve ALL vague references using conversation history:
+   - "in inr" → expand to full request: "Show India GDP 2000-2024 line graph in INR"
+   - "grph" or "graph" alone → "Show [last discussed data topic] as a line graph"
+   - "same for china" → "Show [same metric/years] for China as a line graph"
+   - "in dollars" → restate full request with currency changed
+   - "make it a bar chart" → restate full request with chart type changed
+3. Append chart type if implied:
+   - "breakdown/share/proportion/percentage" → append "(pie chart)"
+   - "compare/vs/ranking/top N/countries" → append "(bar chart)"
+   - "over time/trend/history/years/growth" → append "(line chart)"
+4. Always output a COMPLETE graph request with: what to show, time range if any, unit if any, chart type
+
+Output ONLY the refined message. No explanation, no preamble."""
 
 GRAPH_SYSTEM_PROMPT = """You are a data assistant. Output ONLY a single valid JSON object — no prose, no markdown fences.
 
@@ -481,19 +505,32 @@ async def refine_prompt(message: str, history: list[HistoryEntry],
                         system_prompt: str = REFINE_SYSTEM_PROMPT) -> str:
     if not message or not message.strip():
         return message
+
+    # Skip refinement for long, clearly complete messages (saves tokens)
+    msg = message.strip()
+    if len(msg) > 200 and ' ' in msg and not any(
+        vague in msg.lower() for vague in ['in inr', 'in usd', 'same for', 'make it', 'show it', 'as graph', 'grph']
+    ):
+        return message
+
     history_snippet = ""
     if history:
-        lines = [f"{'Student' if e.role=='user' else 'Tutor'}: {e.content[:200]}" for e in history[-10:]]
+        # Include last 20 entries, with more content per entry for context
+        lines = [
+            f"{'Student' if e.role=='user' else 'Tutor'}: {e.content[:400]}"
+            for e in history[-20:]
+        ]
         history_snippet = "\n".join(lines)
+
     user_content = (
-        f"Conversation history:\n{history_snippet}\n\nMessage to refine: {message}"
-        if history_snippet else f"Message to refine: {message}"
+        f"=== Conversation History ===\n{history_snippet}\n\n=== Message to refine ===\n{msg}"
+        if history_snippet else f"Message to refine: {msg}"
     )
     try:
         response = client.chat.completions.create(
             model=MODELS["flash"],
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}],
-            max_tokens=256, temperature=0.2,
+            max_tokens=512, temperature=0.2,
         )
         refined = response.choices[0].message.content.strip()
         if not refined or len(refined) > len(message) * 5:
