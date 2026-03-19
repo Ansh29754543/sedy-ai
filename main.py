@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(me
 logger = logging.getLogger("sedy")
 
 # ── App ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Sedy API", version="3.5.0")
+app = FastAPI(title="Sedy API", version="3.6.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,7 +38,6 @@ MODELS = {
     "code":  "deepseek-r1-distill-qwen-32b",
 }
 
-NO_SYSTEM_ROLE_MODELS: set[str] = set()
 DEFAULT_MODEL = MODELS["pro"]
 
 AUTO_MODEL_MAP = {
@@ -62,60 +61,97 @@ def resolve_model(requested: str | None, task: str = "chat") -> str:
 
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 
-# ── PDF library ────────────────────────────────────────────────────────────────
+# ── PDF Engine Detection ───────────────────────────────────────────────────────
+# Prefer PyMuPDF (fitz) — it supports OCR for scanned PDFs.
+# Falls back to pypdf or pdfplumber if PyMuPDF is not installed.
 PDF_ENGINE = None
 try:
-    from pypdf import PdfReader as _PyPdfReader
-    PDF_ENGINE = "pypdf"
-    logger.info("PDF engine: pypdf")
+    import fitz  # PyMuPDF — best, has OCR built-in
+    PDF_ENGINE = "pymupdf"
+    logger.info("PDF engine: pymupdf (with OCR support)")
 except ImportError:
     try:
-        import pdfplumber as _pdfplumber
-        PDF_ENGINE = "pdfplumber"
-        logger.info("PDF engine: pdfplumber")
+        from pypdf import PdfReader as _PyPdfReader
+        PDF_ENGINE = "pypdf"
+        logger.info("PDF engine: pypdf (no OCR — scanned PDFs will fail)")
     except ImportError:
         try:
-            import fitz
-            PDF_ENGINE = "pymupdf"
-            logger.info("PDF engine: pymupdf")
+            import pdfplumber as _pdfplumber
+            PDF_ENGINE = "pdfplumber"
+            logger.info("PDF engine: pdfplumber (no OCR — scanned PDFs will fail)")
         except ImportError:
-            logger.warning("No PDF library found! Install pypdf, pdfplumber, or PyMuPDF.")
+            logger.warning("No PDF library found! Install pymupdf: pip install pymupdf")
+
+
+def _ocr_page_fitz(page) -> str:
+    """Try OCR on a single PyMuPDF page. Returns empty string on failure."""
+    try:
+        tp = page.get_textpage_ocr(flags=0, language="eng")
+        return page.get_text(textpage=tp)
+    except Exception as e:
+        logger.warning(f"OCR failed on page: {e}")
+        return ""
 
 
 def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, int]:
-    if PDF_ENGINE == "pypdf":
+    """
+    Extract text from PDF bytes. Returns (full_text, page_count).
+    Automatically falls back to OCR for scanned / image-only pages
+    when PyMuPDF is available.
+    """
+
+    # ── PyMuPDF (primary — supports OCR) ──────────────────────────────────────
+    if PDF_ENGINE == "pymupdf":
+        import fitz
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        extracted = []
+        for i in range(len(doc)):
+            page = doc[i]
+            text = page.get_text().strip()
+            # Heuristic: fewer than 20 meaningful chars → likely image-only page
+            if len(text) < 20:
+                logger.info(f"Page {i+1} appears image-only — attempting OCR")
+                text = _ocr_page_fitz(page)
+            extracted.append(f"\n--- Page {i+1} ---\n{text}")
+        full_text = "\n".join(extracted)
+        return full_text, len(doc)
+
+    # ── pypdf (fallback — text PDFs only) ─────────────────────────────────────
+    elif PDF_ENGINE == "pypdf":
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(pdf_bytes))
-        pages  = reader.pages
-        text   = "\n".join(
-            f"\n--- Page {i+1} ---\n{p.extract_text() or ''}"
-            for i, p in enumerate(pages)
-        )
-        return text, len(pages)
+        pages = reader.pages
+        extracted = []
+        for i, p in enumerate(pages):
+            text = p.extract_text() or ""
+            extracted.append(f"\n--- Page {i+1} ---\n{text}")
+        full_text = "\n".join(extracted)
 
+        # Warn if the document looks scanned
+        meaningful = len(re.sub(r"[\s\-]", "", full_text))
+        if meaningful < 100:
+            logger.warning(
+                "pypdf extracted almost no text — PDF is likely scanned. "
+                "Install pymupdf for OCR support: pip install pymupdf"
+            )
+
+        return full_text, len(pages)
+
+    # ── pdfplumber (fallback — text PDFs only) ─────────────────────────────────
     elif PDF_ENGINE == "pdfplumber":
         import pdfplumber
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             pages = pdf.pages
-            text  = "\n".join(
+            text = "\n".join(
                 f"\n--- Page {i+1} ---\n{p.extract_text() or ''}"
                 for i, p in enumerate(pages)
             )
             return text, len(pages)
 
-    elif PDF_ENGINE == "pymupdf":
-        import fitz
-        doc   = fitz.open(stream=pdf_bytes, filetype="pdf")
-        text  = "\n".join(
-            f"\n--- Page {i+1} ---\n{doc[i].get_text()}"
-            for i in range(len(doc))
-        )
-        return text, len(doc)
-
     else:
         raise RuntimeError(
             "No PDF library is installed on the server. "
-            "Please install 'pypdf' (pip install pypdf)."
+            "Please install pymupdf: pip install pymupdf"
         )
 
 
@@ -424,17 +460,17 @@ class FlowchartNode(BaseModel):
     id: str
     label: str
     sub: str = ""
-    shape: str = "rect"   # oval | rect | diamond | para
-    col: str = "blue"     # gray | blue | teal | amber | green | coral | purple
+    shape: str = "rect"
+    col: str = "blue"
     x: float = 0
     y: float = 0
 
 class FlowchartEdge(BaseModel):
-    f: str          # from node id
-    t: str          # to node id
+    f: str
+    t: str
     label: str = ""
     back: bool = False
-    bx: float = 0   # waypoint x for back-edges
+    bx: float = 0
 
 class FlowchartResponse(BaseModel):
     title: str
@@ -697,6 +733,44 @@ async def fetch_live_data(query: str) -> str:
         return ""
 
 
+def _decode_pdf_base64(raw_b64: str) -> bytes:
+    """Decode base64 PDF string, stripping data-URI prefix if present."""
+    if "," in raw_b64:
+        raw_b64 = raw_b64.split(",", 1)[1]
+    raw_b64 = raw_b64.strip().replace("\n", "").replace("\r", "").replace(" ", "")
+    try:
+        return base64.b64decode(raw_b64)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 PDF data: {exc}")
+
+
+def _validate_and_extract_pdf(pdf_bytes: bytes, pdf_name: str) -> tuple[str, int]:
+    """Validate PDF header, extract text, handle errors consistently."""
+    if not pdf_bytes.startswith(b"%PDF"):
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file does not appear to be a valid PDF (missing %PDF header).",
+        )
+    try:
+        pdf_text, page_count = extract_pdf_text(pdf_bytes)
+        logger.info(f"Extracted {len(pdf_text)} chars from {page_count} pages ({pdf_name}), engine={PDF_ENGINE}")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Could not read PDF: {exc}")
+
+    if not pdf_text.strip():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This PDF appears to be image-only (scanned) and no text could be extracted. "
+                + ("Install pymupdf for OCR support." if PDF_ENGINE != "pymupdf" else
+                   "OCR was attempted but produced no output — the PDF may be corrupted or use an unsupported format.")
+            ),
+        )
+    return pdf_text, page_count
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ── ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
@@ -705,8 +779,9 @@ async def fetch_live_data(query: str) -> str:
 async def root():
     return {
         "status": "Sedy API is live 🚀",
-        "version": "3.5.0",
-        "pdf_engine": PDF_ENGINE or "none — install pypdf!",
+        "version": "3.6.0",
+        "pdf_engine": PDF_ENGINE or "none — install pymupdf!",
+        "ocr_support": PDF_ENGINE == "pymupdf",
         "live_data": bool(SERPER_API_KEY),
         "endpoints": [
             "/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat",
@@ -976,37 +1051,8 @@ async def pdf_chat(req: PdfChatRequest):
     pdf_name = req.pdf_name.strip() or "document.pdf"
     logger.info(f"/pdf-chat  model={model}  file={pdf_name!r}  msg={req.message[:80]!r}")
 
-    raw_b64 = req.pdf_base64
-    if "," in raw_b64:
-        raw_b64 = raw_b64.split(",", 1)[1]
-    raw_b64 = raw_b64.strip().replace("\n", "").replace("\r", "").replace(" ", "")
-    try:
-        pdf_bytes = base64.b64decode(raw_b64)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid base64 PDF data: {exc}")
-
-    if not pdf_bytes.startswith(b"%PDF"):
-        raise HTTPException(
-            status_code=400,
-            detail="The uploaded file does not appear to be a valid PDF (missing %PDF header).",
-        )
-
-    try:
-        pdf_text, page_count = extract_pdf_text(pdf_bytes)
-        logger.info(f"/pdf-chat  {len(pdf_text)} chars from {page_count} pages  engine={PDF_ENGINE}")
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Could not read PDF: {exc}")
-
-    if not pdf_text.strip():
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "This PDF appears to be image-only (scanned) and contains no extractable text. "
-                "Please try a text-based PDF, or copy-paste the text you'd like help with."
-            ),
-        )
+    pdf_bytes = _decode_pdf_base64(req.pdf_base64)
+    pdf_text, page_count = _validate_and_extract_pdf(pdf_bytes, pdf_name)
 
     MAX_PDF_CHARS = 80_000
     truncation_note = ""
@@ -1111,18 +1157,14 @@ async def generate_notes(req: NotesRequest):
         raise HTTPException(status_code=400, detail="topic must not be empty")
 
     if req.pdf_base64:
-        try:
-            raw_b64   = req.pdf_base64.split(",", 1)[1] if "," in req.pdf_base64 else req.pdf_base64
-            pdf_bytes = base64.b64decode(raw_b64.strip())
-            pdf_text, page_count = extract_pdf_text(pdf_bytes)
-            if len(pdf_text) > 60_000:
-                pdf_text = pdf_text[:60_000] + "\n\n[truncated]"
-            user_prompt = (
-                f'Generate comprehensive study notes on "{topic}" '
-                f'based on this document ({req.pdf_name}, {page_count} pages):\n\n{pdf_text}'
-            )
-        except Exception as e:
-            raise HTTPException(status_code=422, detail=f"Could not read PDF: {e}")
+        pdf_bytes = _decode_pdf_base64(req.pdf_base64)
+        pdf_text, page_count = _validate_and_extract_pdf(pdf_bytes, req.pdf_name or "document.pdf")
+        if len(pdf_text) > 60_000:
+            pdf_text = pdf_text[:60_000] + "\n\n[truncated]"
+        user_prompt = (
+            f'Generate comprehensive study notes on "{topic}" '
+            f'based on this document ({req.pdf_name}, {page_count} pages):\n\n{pdf_text}'
+        )
     else:
         user_prompt = f'Generate comprehensive study notes on: "{topic}"'
 
@@ -1160,18 +1202,14 @@ async def formula_sheet(req: FormulaRequest):
         raise HTTPException(status_code=400, detail="topic must not be empty")
 
     if req.pdf_base64:
-        try:
-            raw_b64   = req.pdf_base64.split(",", 1)[1] if "," in req.pdf_base64 else req.pdf_base64
-            pdf_bytes = base64.b64decode(raw_b64.strip())
-            pdf_text, page_count = extract_pdf_text(pdf_bytes)
-            if len(pdf_text) > 60_000:
-                pdf_text = pdf_text[:60_000] + "\n\n[truncated]"
-            user_prompt = (
-                f'Generate a complete formula and key terms sheet for "{topic}" '
-                f'based on this document ({req.pdf_name}, {page_count} pages):\n\n{pdf_text}'
-            )
-        except Exception as e:
-            raise HTTPException(status_code=422, detail=f"Could not read PDF: {e}")
+        pdf_bytes = _decode_pdf_base64(req.pdf_base64)
+        pdf_text, page_count = _validate_and_extract_pdf(pdf_bytes, req.pdf_name or "document.pdf")
+        if len(pdf_text) > 60_000:
+            pdf_text = pdf_text[:60_000] + "\n\n[truncated]"
+        user_prompt = (
+            f'Generate a complete formula and key terms sheet for "{topic}" '
+            f'based on this document ({req.pdf_name}, {page_count} pages):\n\n{pdf_text}'
+        )
     else:
         user_prompt = f'Generate a complete formula and key terms reference sheet for: "{topic}"'
 
@@ -1204,9 +1242,7 @@ async def flowchart(req: FlowchartRequest):
     model = resolve_model(req.model, "flowchart")
     logger.info(f"/flowchart  model={model}  msg={req.message[:80]!r}")
 
-    # Refine the message using conversation history
     refined = await refine_prompt(req.message, req.history)
-
     user_prompt = f"Create a flowchart for: {refined}"
 
     try:
@@ -1235,7 +1271,6 @@ async def flowchart(req: FlowchartRequest):
         for n in obj.get("nodes", []):
             if not isinstance(n, dict):
                 continue
-            # Validate and clamp x/y so nodes always stay on canvas
             x = max(20, min(float(n.get("x", 280)), 520))
             y = max(20, float(n.get("y", 40)))
             nodes.append(FlowchartNode(
@@ -1255,7 +1290,6 @@ async def flowchart(req: FlowchartRequest):
                 continue
             f_id = str(e.get("f", ""))
             t_id = str(e.get("t", ""))
-            # Only include edges where both nodes exist
             if f_id not in node_ids or t_id not in node_ids:
                 logger.warning(f"/flowchart  skipping edge {f_id}→{t_id} — node not found")
                 continue
