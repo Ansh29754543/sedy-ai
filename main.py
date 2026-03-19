@@ -1007,7 +1007,7 @@ async def code_questions(req: CodeQuestionsRequest):
 # ── /generate-image ────────────────────────────────────────────────────────────
 
 HF_TOKEN     = os.environ.get("HF_TOKEN", "")
-HF_MODEL_URL = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell/v1/text-to-image"
+HF_MODEL_URL = "https://router.huggingface.co/fal-ai/flux/schnell"
 
 @app.post("/generate-image", response_model=ImageGenResponse)
 async def generate_image(req: ImageGenRequest):
@@ -1033,8 +1033,9 @@ async def generate_image(req: ImageGenRequest):
                         "Content-Type": "application/json",
                     },
                     json={
-                        "inputs": refined_prompt,
-                        "parameters": {"num_inference_steps": 4}
+                        "prompt": refined_prompt,
+                        "num_inference_steps": 4,
+                        "image_size": "landscape_4_3",
                     },
                 )
                 logger.info(f"/generate-image  attempt={attempt+1}  status={resp.status_code}  ct={resp.headers.get('content-type','?')}")
@@ -1048,29 +1049,40 @@ async def generate_image(req: ImageGenRequest):
                 if resp.status_code == 200:
                     content_type = resp.headers.get("content-type", "").split(";")[0].strip()
 
-                    # New router API returns raw image bytes directly
+                    # Raw image bytes
                     if content_type.startswith("image/"):
                         img_b64  = base64.b64encode(resp.content).decode("utf-8")
                         data_url = f"data:{content_type};base64,{img_b64}"
                         logger.info(f"/generate-image  success (raw)  size={len(resp.content)//1024}KB")
                         return ImageGenResponse(image_url=data_url, prompt_used=refined_prompt)
 
-                    # Some responses come as JSON with base64
-                    if "application/json" in content_type or content_type == "":
-                        try:
-                            j = resp.json()
-                            # Format: [{"image": "base64..."}] or {"image": "base64..."}
-                            if isinstance(j, list) and j:
-                                j = j[0]
-                            img_data = j.get("image") or j.get("data") or j.get("b64_json")
-                            if img_data:
-                                data_url = f"data:image/jpeg;base64,{img_data}"
-                                logger.info(f"/generate-image  success (json b64)")
+                    # JSON response (fal-ai returns {"images": [{"url": "..."}]} or base64)
+                    try:
+                        j = resp.json()
+                        # fal-ai format: {"images": [{"url": "data:image/...;base64,..."}]}
+                        images = j.get("images") or j.get("data") or []
+                        if isinstance(images, list) and images:
+                            img = images[0]
+                            url = img.get("url") or img.get("image") or img.get("b64_json") or ""
+                            if url.startswith("data:"):
+                                logger.info(f"/generate-image  success (fal-ai data url)")
+                                return ImageGenResponse(image_url=url, prompt_used=refined_prompt)
+                            if url.startswith("http"):
+                                # fetch the actual image
+                                img_resp = await c.get(url)
+                                img_b64  = base64.b64encode(img_resp.content).decode("utf-8")
+                                data_url = f"data:image/jpeg;base64,{img_b64}"
+                                logger.info(f"/generate-image  success (fal-ai url fetch)")
                                 return ImageGenResponse(image_url=data_url, prompt_used=refined_prompt)
-                        except Exception:
-                            pass
+                        # plain base64 field
+                        b64 = j.get("image") or j.get("b64_json")
+                        if b64:
+                            data_url = f"data:image/jpeg;base64,{b64}"
+                            return ImageGenResponse(image_url=data_url, prompt_used=refined_prompt)
+                    except Exception as parse_err:
+                        logger.warning(f"/generate-image  parse error: {parse_err}")
 
-                    last_error = f"Unexpected content-type: {content_type} — {resp.text[:150]}"
+                    last_error = f"Unexpected response: {resp.text[:200]}"
                     await asyncio.sleep(5)
                     continue
 
