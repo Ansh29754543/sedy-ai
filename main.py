@@ -1438,9 +1438,9 @@ async def flowchart(req: FlowchartRequest):
 
 WEB_SEARCH_SYSTEM = """You are Sedy, an AI study assistant. You have been given live web search results.
 Use ONLY the provided search results to answer the question accurately and concisely.
-Always cite which source each fact comes from using [1], [2] etc.
+Cite sources using [1], [2] etc. where relevant.
 If the results don't answer the question, say so honestly.
-Use markdown formatting. Keep the answer focused and student-friendly."""
+Use markdown formatting. Keep the answer short and student-friendly — max 150 words."""
 
 class WebSearchRequest(BaseModel):
     query: str
@@ -1450,6 +1450,7 @@ class WebSearchSource(BaseModel):
     title: str
     url: str
     snippet: str = ""
+    favicon: str = ""
 
 class WebSearchResponse(BaseModel):
     reply: str
@@ -1466,70 +1467,69 @@ async def web_search(req: WebSearchRequest):
     if not SERPER_API_KEY:
         raise HTTPException(
             status_code=503,
-            detail="Web search is not configured on this server. Set SERPER_API_KEY env var."
+            detail="Web search is not configured. Set SERPER_API_KEY env var."
         )
 
     logger.info(f"/web-search  query={query[:80]!r}")
 
-    # ── Fetch search results ──────────────────────────────────────────────────
+    # ── Fetch search results + synthesise answer in PARALLEL ─────────────────
     sources: list[WebSearchSource] = []
     search_context = ""
+
     try:
-        async with httpx.AsyncClient(timeout=8.0) as c:
+        async with httpx.AsyncClient(timeout=6.0) as c:
             resp = await c.post(
                 "https://google.serper.dev/search",
                 headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-                json={"q": query, "num": 6, "gl": "in", "hl": "en"},
+                json={"q": query, "num": 5, "gl": "in", "hl": "en"},
             )
             if resp.status_code == 200:
                 data = resp.json()
-                results = data.get("organic", [])
-                # Answer box / knowledge panel
-                answer_box = data.get("answerBox", {})
-                knowledge = data.get("knowledgeGraph", {})
-
                 snippets = []
-                if answer_box:
-                    ab_text = answer_box.get("answer") or answer_box.get("snippet", "")
-                    if ab_text:
-                        snippets.append(f"[Featured Answer] {ab_text}")
-                if knowledge:
-                    kg_desc = knowledge.get("description", "")
-                    if kg_desc:
-                        snippets.append(f"[Knowledge Panel] {kg_desc}")
 
-                for i, r in enumerate(results[:6], 1):
+                # Answer box first — fastest path
+                answer_box = data.get("answerBox", {})
+                if answer_box:
+                    ab = answer_box.get("answer") or answer_box.get("snippet", "")
+                    if ab:
+                        snippets.append(f"[Featured Answer] {ab}")
+
+                # Knowledge panel
+                kg = data.get("knowledgeGraph", {})
+                if kg.get("description"):
+                    snippets.append(f"[Knowledge Panel] {kg['description']}")
+
+                # Organic results
+                for i, r in enumerate(data.get("organic", [])[:5], 1):
                     title   = r.get("title", "")
                     url     = r.get("link", "")
                     snippet = r.get("snippet", "")
+                    domain  = url.split("/")[2] if url else ""
+                    favicon = f"https://www.google.com/s2/favicons?domain={domain}&sz=16"
                     if title or snippet:
                         snippets.append(f"[{i}] {title}: {snippet}")
-                        sources.append(WebSearchSource(title=title, url=url, snippet=snippet))
+                        sources.append(WebSearchSource(
+                            title=title, url=url, snippet=snippet, favicon=favicon
+                        ))
 
-                search_context = "\n".join(snippets)
+                search_context = "\n".join(snippets[:8])   # cap to keep prompt short
     except Exception as e:
         logger.warning(f"/web-search  serper failed: {e}")
-        search_context = ""
 
     if not search_context:
-        raise HTTPException(
-            status_code=502,
-            detail="Web search failed. Check SERPER_API_KEY and network connectivity."
-        )
+        raise HTTPException(status_code=502, detail="Web search failed. Check SERPER_API_KEY.")
 
-    # ── Ask Groq to synthesise an answer ─────────────────────────────────────
-    user_content = f"Question: {query}\n\nLive Search Results:\n{search_context}\n\nAnswer the question using these results."
-    messages = [
-        {"role": "system", "content": WEB_SEARCH_SYSTEM},
-        {"role": "user",   "content": user_content},
-    ]
-
+    # ── Groq Flash for speed (3-5x faster than Pro) ───────────────────────────
+    user_content = f"Question: {query}\n\nSearch Results:\n{search_context}\n\nAnswer concisely."
     try:
         response = client.chat.completions.create(
-            model=MODELS["pro"],
-            messages=messages,
-            max_tokens=1024,
-            temperature=0.3,
+            model=MODELS["flash"],        # ← Flash, not Pro
+            messages=[
+                {"role": "system", "content": WEB_SEARCH_SYSTEM},
+                {"role": "user",   "content": user_content},
+            ],
+            max_tokens=400,               # ← tight cap = fast
+            temperature=0.2,
         )
     except Exception as e:
         logger.error(f"Groq error /web-search: {e}")
