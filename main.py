@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(me
 logger = logging.getLogger("sedy")
 
 # ── App ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Sedy API", version="3.6.0")
+app = FastAPI(title="Sedy API", version="3.7.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,29 +32,33 @@ client = Groq(api_key=GROQ_API_KEY)
 
 # ── Available models ───────────────────────────────────────────────────────────
 MODELS = {
-    "pro":   "llama-3.3-70b-versatile",
-    "flash": "llama-3.1-8b-instant",
-    "smart": "qwen/qwen3-32b",
-    "code":  "deepseek-r1-distill-qwen-32b",
+    "pro":    "llama-3.3-70b-versatile",
+    "flash":  "llama-3.1-8b-instant",
+    "smart":  "qwen/qwen3-32b",
+    "code":   "deepseek-r1-distill-qwen-32b",
+    "vision": "meta-llama/llama-4-scout-17b-16e-instruct",  # ← NEW: vision model
 }
 
 DEFAULT_MODEL = MODELS["pro"]
 
 AUTO_MODEL_MAP = {
-    "chat":       MODELS["pro"],
-    "pdf":        MODELS["pro"],
-    "code":       MODELS["code"],
-    "notes":      MODELS["pro"],
-    "formula":    MODELS["smart"],
-    "flashcard":  MODELS["smart"],
-    "quiz":       MODELS["smart"],
-    "graph":      MODELS["smart"],
-    "flowchart":  MODELS["smart"],
-    "intent":     MODELS["flash"],
-    "refine":     MODELS["flash"],
+    "chat":      MODELS["pro"],
+    "pdf":       MODELS["pro"],
+    "code":      MODELS["code"],
+    "notes":     MODELS["pro"],
+    "formula":   MODELS["smart"],
+    "flashcard": MODELS["smart"],
+    "quiz":      MODELS["smart"],
+    "graph":     MODELS["smart"],
+    "flowchart": MODELS["smart"],
+    "intent":    MODELS["flash"],
+    "refine":    MODELS["flash"],
+    "image":     MODELS["vision"],   # ← NEW: always use vision model for images
 }
 
 def resolve_model(requested: str | None, task: str = "chat") -> str:
+    if task == "image":
+        return MODELS["vision"]   # vision model is fixed for image tasks
     if not requested or requested == "auto":
         return AUTO_MODEL_MAP.get(task, DEFAULT_MODEL)
     return MODELS.get(requested, DEFAULT_MODEL)
@@ -62,11 +66,9 @@ def resolve_model(requested: str | None, task: str = "chat") -> str:
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 
 # ── PDF Engine Detection ───────────────────────────────────────────────────────
-# Prefer PyMuPDF (fitz) — it supports OCR for scanned PDFs.
-# Falls back to pypdf or pdfplumber if PyMuPDF is not installed.
 PDF_ENGINE = None
 try:
-    import fitz  # PyMuPDF — best, has OCR built-in
+    import fitz
     PDF_ENGINE = "pymupdf"
     logger.info("PDF engine: pymupdf (with OCR support)")
 except ImportError:
@@ -84,7 +86,6 @@ except ImportError:
 
 
 def _ocr_page_fitz(page) -> str:
-    """Try OCR on a single PyMuPDF page. Returns empty string on failure."""
     try:
         tp = page.get_textpage_ocr(flags=0, language="eng")
         return page.get_text(textpage=tp)
@@ -94,13 +95,6 @@ def _ocr_page_fitz(page) -> str:
 
 
 def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, int]:
-    """
-    Extract text from PDF bytes. Returns (full_text, page_count).
-    Automatically falls back to OCR for scanned / image-only pages
-    when PyMuPDF is available.
-    """
-
-    # ── PyMuPDF (primary — supports OCR) ──────────────────────────────────────
     if PDF_ENGINE == "pymupdf":
         import fitz
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -108,15 +102,12 @@ def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, int]:
         for i in range(len(doc)):
             page = doc[i]
             text = page.get_text().strip()
-            # Heuristic: fewer than 20 meaningful chars → likely image-only page
             if len(text) < 20:
                 logger.info(f"Page {i+1} appears image-only — attempting OCR")
                 text = _ocr_page_fitz(page)
             extracted.append(f"\n--- Page {i+1} ---\n{text}")
         full_text = "\n".join(extracted)
         return full_text, len(doc)
-
-    # ── pypdf (fallback — text PDFs only) ─────────────────────────────────────
     elif PDF_ENGINE == "pypdf":
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -126,18 +117,10 @@ def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, int]:
             text = p.extract_text() or ""
             extracted.append(f"\n--- Page {i+1} ---\n{text}")
         full_text = "\n".join(extracted)
-
-        # Warn if the document looks scanned
         meaningful = len(re.sub(r"[\s\-]", "", full_text))
         if meaningful < 100:
-            logger.warning(
-                "pypdf extracted almost no text — PDF is likely scanned. "
-                "Install pymupdf for OCR support: pip install pymupdf"
-            )
-
+            logger.warning("pypdf extracted almost no text — PDF is likely scanned.")
         return full_text, len(pages)
-
-    # ── pdfplumber (fallback — text PDFs only) ─────────────────────────────────
     elif PDF_ENGINE == "pdfplumber":
         import pdfplumber
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -147,7 +130,6 @@ def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, int]:
                 for i, p in enumerate(pages)
             )
             return text, len(pages)
-
     else:
         raise RuntimeError(
             "No PDF library is installed on the server. "
@@ -176,6 +158,42 @@ STRICT MATH FORMATTING (frontend uses KaTeX):
 - NEVER write bare math like w^2 — always wrap in $w^2$
 - Fractions: $\\frac{a}{b}$  Subscripts: $A_{\\text{base}}$"""
 
+# ── NEW: Vision / Image system prompt ─────────────────────────────────────────
+IMAGE_SYSTEM_PROMPT = """You are Sedy, an intelligent AI study assistant with vision capabilities, made by Ansh Verma.
+The student has shared an image. Your job is to carefully look at it and help them understand it.
+
+YOUR CAPABILITIES:
+- Read printed text, handwritten text, equations from images
+- Solve math problems shown in images (handwritten or printed)
+- Explain diagrams: biology, chemistry, physics, geography, circuits, flowcharts
+- Describe what is in the image clearly
+- Answer questions about the image content
+- Read question papers, textbook pages, notes
+- Identify graphs and explain data trends
+
+MULTILINGUAL SUPPORT — VERY IMPORTANT:
+- If the student writes in Hindi, respond FULLY in Hindi (Devanagari script)
+- If the student writes in Bengali (বাংলা), respond fully in Bengali
+- If the student writes in Tamil (தமிழ்), respond fully in Tamil
+- If the student writes in Telugu (తెలుగు), respond fully in Telugu
+- If the student writes in Kannada (ಕನ್ನಡ), respond fully in Kannada
+- If the student writes in Malayalam (മലയാളം), respond fully in Malayalam
+- If the student writes in Marathi (मराठी), respond fully in Marathi
+- If the student writes in Gujarati (ગુજરાતી), respond fully in Gujarati
+- If the student writes in Punjabi (ਪੰਜਾਬੀ), respond fully in Punjabi
+- If the student writes in Urdu, respond fully in Urdu
+- If the student writes in Odia (ଓଡ଼ିଆ), respond fully in Odia
+- If the student writes in Assamese (অসমীয়া), respond fully in Assamese
+- If the student mixes Hindi + English (Hinglish), respond in the same friendly Hinglish style
+- DEFAULT: Respond in the same language the student used in their question
+- If no question is asked (student just sends the image), describe it helpfully in English and ask what they need help with
+
+FORMAT RULES:
+- Use markdown formatting: ## headers, **bold**, bullet points
+- For math: use LaTeX $...$ inline and $$...$$ display
+- Be thorough — students need real explanations, not vague descriptions
+- Be encouraging and friendly"""
+
 REFINE_SYSTEM_PROMPT = """You are a silent prompt refinement engine for a student AI assistant.
 Your job is to rewrite the student's message into a complete, self-contained, unambiguous request
 by using the conversation history as context.
@@ -194,21 +212,16 @@ RULES:
 
 4. PDF & DOCUMENT CONTEXT (very important):
    - If the history contains a PDF explanation, summary, or Q&A, treat that document as the active topic.
-   - "make notes on it" after a PDF explanation → "Make study notes on [PDF topic, e.g. Light: Shadows and Reflections]"
-   - "make a flowchart" after a PDF explanation → "Make a flowchart for [PDF topic, e.g. Light: Shadows and Reflections]"
+   - "make notes on it" after a PDF explanation → "Make study notes on [PDF topic]"
+   - "make a flowchart" after a PDF explanation → "Make a flowchart for [PDF topic]"
    - "make flashcards" after a PDF → "Make flashcards on [PDF topic]"
    - "quiz me" after a PDF → "Quiz me on [PDF topic]"
-   - "summarise it" after a PDF → "Summarise [PDF topic/document name]"
-   - "explain more" after a PDF → "Explain [specific section of PDF topic] in more detail"
-   - Always extract the actual subject/topic name from the PDF content in history — never leave it as "it" or "this"
+   - Always extract the actual subject/topic name from the PDF content in history
 
 5. TOPIC MEMORY — always carry the last known topic forward:
    - "explain more" → "Explain [last topic] in more detail"
    - "give an example" → "Give an example of [last concept discussed]"
    - "make it simpler" → "Explain [last topic] in simpler terms"
-   - "what about X" → "How does X relate to [last topic]?"
-   - "notes on it" / "notes on this" → "Make study notes on [last topic from history]"
-   - "flowchart of it" / "flowchart on this" → "Make a flowchart of [last topic from history]"
    - Short follow-ups like "and?" / "more?" / "continue" → "Continue explaining [last topic]"
 
 6. If the message is very short or a single word, ALWAYS expand it using context
@@ -221,13 +234,8 @@ GRAPH_REFINE_SYSTEM_PROMPT = """You are a silent prompt refinement engine for da
 Your job is to rewrite the user's message into a complete, self-contained graph request using history.
 
 RULES:
-1. Fix ALL spelling/typo errors (e.g. "grph" → "graph", "gdp of india" is fine)
-2. Resolve ALL vague references using conversation history:
-   - "in inr" → expand to full request: "Show India GDP 2000-2024 line graph in INR"
-   - "grph" or "graph" alone → "Show [last discussed data topic] as a line graph"
-   - "same for china" → "Show [same metric/years] for China as a line graph"
-   - "in dollars" → restate full request with currency changed
-   - "make it a bar chart" → restate full request with chart type changed
+1. Fix ALL spelling/typo errors
+2. Resolve ALL vague references using conversation history
 3. Append chart type if implied:
    - "breakdown/share/proportion/percentage" → append "(pie chart)"
    - "compare/vs/ranking/top N/countries" → append "(bar chart)"
@@ -289,7 +297,7 @@ SHAPE RULES:
 - oval   → start and end nodes ONLY
 - rect   → regular process steps
 - diamond → decision / condition nodes (always have Yes/No branches)
-- para   → input / output operations (user input, data output)
+- para   → input / output operations
 
 COLOR RULES:
 - gray   → start and end ovals
@@ -300,23 +308,15 @@ COLOR RULES:
 - coral  → error / failure / rejection path
 - purple → complex internal logic / sub-process
 
-LAYOUT RULES (CRITICAL — the frontend renders nodes at exact x,y pixel positions):
-- Canvas is 680px wide. Keep all node x values between 20 and 520 (node width = 140px, so right edge = x+140).
-- Main flow goes top-to-bottom with ~100px vertical spacing between node centers.
-- Branch left for No/error paths: use x around 60-100
-- Branch right for Yes/alternate paths or parallel flows: use x around 420-480
+LAYOUT RULES:
+- Canvas is 680px wide. Keep all node x values between 20 and 520.
+- Main flow goes top-to-bottom with ~100px vertical spacing.
+- Branch left for No/error paths: x around 60-100
+- Branch right for Yes/alternate paths: x around 420-480
 - Center (main flow) x should be around 250-280
-- Decision nodes branch: one child directly below (same x), one child to the left or right
-- back edges (loop-backs): set "back": true and provide "bx" — the x coordinate of the waypoint for the return arrow. Use bx < 20 for left-side loops, bx > 540 for right-side loops.
-- Nodes must NOT overlap: minimum 80px vertical gap between nodes at the same x column; minimum 160px horizontal gap between nodes at the same y row.
-- Start with y=40 for the first node. Increment y by 90-110 for each level.
-- For branching: branch children start at the same y as each other, positioned left/right of center.
-
-LABEL RULES:
-- Labels must be plain text — no markdown, no LaTeX, no special symbols except standard math (², ³, ÷, ≤, ≥, ≠, →)
-- Use \\n to break long labels into 2 lines
-- Keep labels SHORT — the box is only 140px wide
-- edge labels: only "Yes", "No", or a very short phrase (max 10 chars)
+- back edges (loop-backs): set "back": true and provide "bx"
+- Nodes must NOT overlap: minimum 80px vertical gap at same x
+- Start with y=40 for the first node
 
 OUTPUT ONLY THE JSON. Nothing else."""
 
@@ -324,12 +324,12 @@ PDF_SYSTEM_PROMPT = """You are Sedy, an intelligent student learning assistant m
 The user has uploaded a PDF whose FULL TEXT is embedded below between === DOCUMENT START === and === DOCUMENT END ===.
 
 YOUR RULES:
-1. Base ALL answers strictly on the document text provided. Do NOT say "I don't have access" — the text IS right there.
-2. If asked to summarise: write ## headings for each major section, bullet-point the key ideas under each heading.
-3. If asked a question: find the relevant passage and explain it clearly. Quote the page number when useful.
+1. Base ALL answers strictly on the document text provided.
+2. If asked to summarise: write ## headings for each major section, bullet-point the key ideas.
+3. If asked a question: find the relevant passage and explain it clearly.
 4. If the answer genuinely isn't in the document, say "This topic isn't covered in this PDF."
-5. Use markdown formatting (##, **, bullets). Use LaTeX for math: $...$ inline, $$...$$ display.
-6. Be thorough — do NOT give short or vague answers. Students need real detail."""
+5. Use markdown formatting. Use LaTeX for math: $...$ inline, $$...$$ display.
+6. Be thorough — do NOT give short or vague answers."""
 
 INTENT_SYSTEM_PROMPT = """You are an intent classifier for a student learning app.
 Output EXACTLY one word from: graph, flashcard, quiz, both, notes, formula, flowchart, chat
@@ -340,29 +340,20 @@ quiz      = wants MCQ quiz
 both      = wants flashcards AND a quiz
 notes     = wants structured study notes, revision notes, a summary in note form, key points as notes
 formula   = wants a formula sheet, key terms, definitions list, cheat sheet, or terminology reference
-flowchart = user asks for a flowchart, flow diagram, process diagram, diagram of a process, "diagram of X",
-            "draw the steps of X", "flowchart for X", "how does X work as a diagram", "show me the process of X",
-            "map out X", "chart the steps", "draw X process", or just "make a flowchart" / "flowchart" as a
-            follow-up after any previous explanation or PDF. Trigger even without the word "flowchart" if the
-            user clearly wants a visual step-by-step process diagram.
-chat      = everything else — explanations, questions, math problems, coding, "write answer", "explain", "solve",
-            "what is", "how does", general conversation
+flowchart = user asks for a flowchart, flow diagram, process diagram, diagram of a process
+chat      = everything else
 
-CONTEXT-AWARE FOLLOW-UP RULES (use conversation history to classify short messages):
-- "make notes on it" / "notes on this" / "make some notes" after ANY topic or PDF → notes
-- "make a flowchart" / "flowchart" / "flowchart of it" after ANY topic or PDF → flowchart
-- "make flashcards" / "flashcards on it" after ANY topic or PDF → flashcard
-- "quiz me" / "quiz me on it" / "test me" after ANY topic or PDF → quiz
-- "formula sheet" / "key terms" / "cheat sheet" after ANY topic or PDF → formula
-- Short follow-ups that reference a previous topic should inherit intent from the request type
+CONTEXT-AWARE FOLLOW-UP RULES:
+- "make notes on it" after ANY topic or PDF → notes
+- "make a flowchart" after ANY topic or PDF → flowchart
+- "make flashcards" after ANY topic or PDF → flashcard
+- "quiz me" after ANY topic or PDF → quiz
+- "formula sheet" after ANY topic or PDF → formula
 
 CRITICAL:
-- If the user asks a math question, wants an explanation, says "write answer", "solve this" — output: chat
-- Only output "graph" if the user literally asks for a chart or visualisation of data
-- Only output "flowchart" if the user wants a visual process/flow diagram
-- Infer "notes" and "formula" from context and intent, not just keywords
-- When unsure between notes/chat, prefer notes if it seems like a study/revision request
-- A bare "make a flowchart" with no other context still means: flowchart
+- Math questions, explanations, "solve this" → chat
+- Only "graph" if user literally asks for a chart
+- Only "flowchart" if user wants a visual process diagram
 
 No punctuation, no explanation. One word only."""
 
@@ -376,10 +367,9 @@ FORMAT RULES:
 4. Bold (**term**) all key terms when first introduced
 5. Use LaTeX for ALL math: $...$ inline, $$...$$ display
 6. End with a ## Key Takeaways section with 4-6 bullet points
-7. Be comprehensive — cover ALL important aspects of the topic
-8. Write for a student who needs to revise efficiently — clear, concise, complete
+7. Be comprehensive — cover ALL important aspects
 
-Do NOT add preamble like "Here are your notes". Start directly with the ## heading."""
+Do NOT add preamble. Start directly with the ## heading."""
 
 FORMULA_SYSTEM_PROMPT = """You are Sedy, an expert at creating formula and key terms reference sheets for students made by Ansh Verma.
 Generate a complete reference sheet for the given topic.
@@ -388,15 +378,13 @@ FORMAT RULES:
 1. Start with ## [Topic] — Formula & Key Terms Sheet
 2. Split into two sections:
    ### 📐 Formulas & Equations
-   - Each formula on its own line: **Name**: $formula$ — brief explanation
-   - Use LaTeX for ALL math: $...$ inline, $$...$$ display
+   - Each formula: **Name**: $formula$ — brief explanation
 
    ### 📖 Key Terms & Definitions
-   - Each term: **Term** — clear, concise definition (1-2 sentences)
+   - Each term: **Term** — clear, concise definition
 
-3. Cover EVERY important formula and term — do not skip any
-4. Order from basic to advanced within each section
-5. If it is a non-math topic (history, biology etc), focus on key terms, dates, names, and concepts
+3. Cover EVERY important formula and term
+4. Order from basic to advanced
 
 Do NOT add preamble. Start directly with the ## heading."""
 
@@ -407,11 +395,10 @@ Generate 2-3 SHORT, RELEVANT multiple-choice questions to clarify missing detail
 
 STRICT RULES:
 - NEVER ask about something the user already mentioned
-- NEVER ask generic or obvious questions
 - Ask only about things that will genuinely change how the code is written
-- Each question must have 3-4 short options (1-5 words each)
-- If the request is already very detailed and nothing is missing, return an empty array []
-- Return ONLY a valid JSON array, no markdown fences, no explanation
+- Each question must have 3-4 short options
+- If the request is already very detailed, return an empty array []
+- Return ONLY a valid JSON array, no markdown fences
 
 FORMAT:
 [
@@ -480,6 +467,13 @@ class IntentRequest(BaseModel):
 class CodeQuestionsRequest(BaseModel):
     message: str
 
+# ── NEW: Image chat request ────────────────────────────────────────────────────
+class ImageChatRequest(BaseModel):
+    message: str = ""           # optional — student's question about the image
+    images: list[str]           # list of base64 image strings (with or without data URI prefix)
+    image_names: list[str] = [] # optional filenames for display
+    history: list[HistoryEntry] = []
+
 # ── Flowchart models ───────────────────────────────────────────────────────────
 class FlowchartRequest(BaseModel):
     message: str
@@ -510,6 +504,10 @@ class FlowchartResponse(BaseModel):
 # ── Response models ────────────────────────────────────────────────────────────
 class ChatResponse(BaseModel):
     reply: str
+
+class ImageChatResponse(BaseModel):
+    reply: str
+    image_count: int
 
 class Flashcard(BaseModel):
     question: str
@@ -579,7 +577,6 @@ def parse_rate_limit_error(exc: Exception) -> dict | None:
     msg = str(exc)
     if "429" not in msg and "rate_limit" not in msg.lower():
         return None
-
     wait_sec = 0
     wait_str = ""
     m = _re.search(r'try again in\s+([\dhms. ]+)', msg, _re.I)
@@ -590,7 +587,6 @@ def parse_rate_limit_error(exc: Exception) -> dict | None:
         minutes = sum(float(x) for x in _re.findall(r'([\d.]+)m', raw))
         seconds = sum(float(x) for x in _re.findall(r'([\d.]+)s', raw))
         wait_sec = int(hours * 3600 + minutes * 60 + seconds)
-
     limit_type = "tokens"
     if "tokens per minute" in msg.lower() or "TPM" in msg:
         limit_type = "TPM"
@@ -598,21 +594,15 @@ def parse_rate_limit_error(exc: Exception) -> dict | None:
         limit_type = "TPD"
     elif "requests per minute" in msg.lower() or "RPM" in msg:
         limit_type = "RPM"
-
     used  = 0
     limit = 0
     mu = _re.search(r'Used\s+([\d,]+)', msg)
     ml = _re.search(r'Limit\s+([\d,]+)', msg)
     if mu: used  = int(mu.group(1).replace(',',''))
     if ml: limit = int(ml.group(1).replace(',',''))
-
     return {
-        "type":         "rate_limit",
-        "wait_seconds": wait_sec,
-        "wait_display": wait_str,
-        "limit_type":   limit_type,
-        "used":         used,
-        "limit":        limit,
+        "type": "rate_limit", "wait_seconds": wait_sec, "wait_display": wait_str,
+        "limit_type": limit_type, "used": used, "limit": limit,
     }
 
 
@@ -701,13 +691,11 @@ async def refine_prompt(message: str, history: list[HistoryEntry],
                         system_prompt: str = REFINE_SYSTEM_PROMPT) -> str:
     if not message or not message.strip():
         return message
-
     msg = message.strip()
     if len(msg) > 200 and ' ' in msg and not any(
         vague in msg.lower() for vague in ['in inr', 'in usd', 'same for', 'make it', 'show it', 'as graph', 'grph']
     ):
         return message
-
     history_snippet = ""
     if history:
         lines = [
@@ -715,7 +703,6 @@ async def refine_prompt(message: str, history: list[HistoryEntry],
             for e in history[-30:]
         ]
         history_snippet = "\n".join(lines)
-
     user_content = (
         f"=== Conversation History ===\n{history_snippet}\n\n=== Message to refine ===\n{msg}"
         if history_snippet else f"Message to refine: {msg}"
@@ -764,7 +751,6 @@ async def fetch_live_data(query: str) -> str:
 
 
 def _decode_pdf_base64(raw_b64: str) -> bytes:
-    """Decode base64 PDF string, stripping data-URI prefix if present."""
     if "," in raw_b64:
         raw_b64 = raw_b64.split(",", 1)[1]
     raw_b64 = raw_b64.strip().replace("\n", "").replace("\r", "").replace(" ", "")
@@ -775,7 +761,6 @@ def _decode_pdf_base64(raw_b64: str) -> bytes:
 
 
 def _validate_and_extract_pdf(pdf_bytes: bytes, pdf_name: str) -> tuple[str, int]:
-    """Validate PDF header, extract text, handle errors consistently."""
     if not pdf_bytes.startswith(b"%PDF"):
         raise HTTPException(
             status_code=400,
@@ -788,17 +773,48 @@ def _validate_and_extract_pdf(pdf_bytes: bytes, pdf_name: str) -> tuple[str, int
         raise HTTPException(status_code=503, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Could not read PDF: {exc}")
-
     if not pdf_text.strip():
         raise HTTPException(
             status_code=422,
             detail=(
                 "This PDF appears to be image-only (scanned) and no text could be extracted. "
                 + ("Install pymupdf for OCR support." if PDF_ENGINE != "pymupdf" else
-                   "OCR was attempted but produced no output — the PDF may be corrupted or use an unsupported format.")
+                   "OCR was attempted but produced no output — the PDF may be corrupted.")
             ),
         )
     return pdf_text, page_count
+
+
+# ── NEW: Image base64 helper ───────────────────────────────────────────────────
+def _prepare_image_url(raw_b64: str) -> str:
+    """
+    Ensure the image is a proper data URI for the vision API.
+    Accepts: raw base64 string, or existing data:image/...;base64,... URI.
+    Returns: data URI string ready to pass to Groq vision API.
+    """
+    raw_b64 = raw_b64.strip().replace("\n", "").replace("\r", "").replace(" ", "")
+
+    # Already a data URI — return as-is
+    if raw_b64.startswith("data:image/"):
+        return raw_b64
+
+    # Detect image type from magic bytes
+    try:
+        img_bytes = base64.b64decode(raw_b64[:64])  # just first bytes to detect type
+        if img_bytes[:2] == b'\xff\xd8':
+            mime = "image/jpeg"
+        elif img_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+            mime = "image/png"
+        elif img_bytes[:6] in (b'GIF87a', b'GIF89a'):
+            mime = "image/gif"
+        elif img_bytes[:4] == b'RIFF' and img_bytes[8:12] == b'WEBP':
+            mime = "image/webp"
+        else:
+            mime = "image/jpeg"  # default fallback
+    except Exception:
+        mime = "image/jpeg"
+
+    return f"data:{mime};base64,{raw_b64}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -809,13 +825,15 @@ def _validate_and_extract_pdf(pdf_bytes: bytes, pdf_name: str) -> tuple[str, int
 async def root():
     return {
         "status": "Sedy API is live 🚀",
-        "version": "3.6.0",
+        "version": "3.7.0",
         "pdf_engine": PDF_ENGINE or "none — install pymupdf!",
         "ocr_support": PDF_ENGINE == "pymupdf",
+        "vision_model": MODELS["vision"],
         "live_data": bool(SERPER_API_KEY),
         "endpoints": [
             "/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat",
-            "/intent", "/code-questions", "/notes", "/formula-sheet", "/flowchart"
+            "/intent", "/code-questions", "/notes", "/formula-sheet",
+            "/flowchart", "/image-chat",
         ],
     }
 
@@ -872,6 +890,83 @@ async def chat(req: ChatRequest):
     return ChatResponse(reply=reply)
 
 
+# ── NEW: /image-chat ───────────────────────────────────────────────────────────
+
+@app.post("/image-chat", response_model=ImageChatResponse)
+async def image_chat(req: ImageChatRequest):
+    """
+    Vision endpoint — accepts 1-5 images as base64 strings + an optional question.
+    Uses Llama 4 Scout (meta-llama/llama-4-scout-17b-16e-instruct) on Groq.
+    Responds in whatever Indian language the student used in their question.
+    """
+    if not req.images:
+        raise HTTPException(status_code=400, detail="At least one image is required.")
+
+    # Cap at 5 images (model limit)
+    images = req.images[:5]
+    image_count = len(images)
+
+    logger.info(f"/image-chat  images={image_count}  msg={req.message[:80]!r}")
+
+    # Build the user content block with image(s) + text
+    content: list[dict] = []
+
+    for i, raw_b64 in enumerate(images):
+        try:
+            image_url = _prepare_image_url(raw_b64)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid image {i+1}: {e}")
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": image_url},
+        })
+
+    # Attach the student's question (or a default prompt if none)
+    question = req.message.strip() if req.message.strip() else (
+        "Please look at this image carefully and describe what you see. "
+        "If it contains any text, equations, diagrams or problems, explain them clearly. "
+        "Then ask me what I need help with."
+    )
+    content.append({"type": "text", "text": question})
+
+    # Build message list — include recent history as text only
+    messages: list[dict] = [{"role": "system", "content": IMAGE_SYSTEM_PROMPT}]
+
+    # Add last 6 history turns as plain text (no images in history)
+    sanitised: list[dict] = []
+    for entry in req.history[-6:]:
+        role = entry.role if entry.role in ("user", "assistant") else "user"
+        if sanitised and sanitised[-1]["role"] == role:
+            sanitised[-1]["content"] += "\n" + entry.content
+        else:
+            sanitised.append({"role": role, "content": entry.content})
+    messages.extend(sanitised)
+
+    # The actual image + question turn
+    messages.append({"role": "user", "content": content})
+
+    try:
+        response = client.chat.completions.create(
+            model=MODELS["vision"],
+            messages=messages,
+            max_tokens=4096,
+            temperature=0.4,
+        )
+    except Exception as e:
+        logger.error(f"Groq error /image-chat: {e}")
+        rl = parse_rate_limit_error(e)
+        if rl:
+            raise HTTPException(status_code=429, detail=rl)
+        raise HTTPException(status_code=502, detail=f"Groq vision API error: {e}")
+
+    reply = strip_think_tags(response.choices[0].message.content.strip())
+    if not reply:
+        reply = "I could see the image but couldn't generate a response. Please try again."
+
+    logger.info(f"/image-chat  reply_len={len(reply)}")
+    return ImageChatResponse(reply=reply, image_count=image_count)
+
+
 # ── /flashcards ────────────────────────────────────────────────────────────────
 
 @app.post("/flashcards", response_model=FlashcardResponse)
@@ -885,21 +980,16 @@ async def flashcards(req: FlashcardRequest):
     topic = resolve_topic_from_history(topic, req.history)
     if not topic:
         raise HTTPException(status_code=400, detail="topic must not be empty")
-
     auto_count = req.count == 0
     count = max(1, min(req.count, 50)) if not auto_count else 0
-
     if not auto_count:
         count_instr = f"Generate exactly {count} flashcards"
     else:
         count_instr = (
             "Decide for yourself how many flashcards are needed to fully cover every "
             "important concept in this topic. "
-            "Use your judgment: simple/narrow topics need 8-12 cards; "
-            "broad, multi-concept, or multi-chapter topics need 15-30 cards. "
-            "Generate ALL the cards needed — do NOT stop early."
+            "Simple/narrow topics need 8-12 cards; broad topics need 15-30 cards."
         )
-
     user_prompt = (
         f'{count_instr} about "{topic}".\n'
         f'Each card must cover a distinct concept — no duplicates.\n'
@@ -949,25 +1039,19 @@ async def quiz(req: QuizRequest):
     if not topic:
         raise HTTPException(status_code=400, detail="topic must not be empty")
     difficulty = req.difficulty if req.difficulty in ("easy", "medium", "hard") else "medium"
-
     auto_count = req.count == 0
     count = max(1, min(req.count, 50)) if not auto_count else 0
-
     if not auto_count:
         count_instr = f"Generate exactly {count} {difficulty} MCQ questions"
     else:
         count_instr = (
             f"Decide for yourself how many {difficulty} MCQ questions are needed to "
-            f"properly test every important concept in this topic. "
-            f"Use your judgment: focused topics need 8-10 questions; "
-            f"broad or multi-chapter topics need 12-20 questions. "
-            f"Generate ALL necessary questions — do NOT cut short."
+            f"properly test every important concept in this topic."
         )
-
     user_prompt = (
         f'{count_instr} about "{topic}".\n'
         f'Each question must test a different concept — no duplicates.\n'
-        f'Return ONLY a valid JSON array, no markdown, no extra text:\n'
+        f'Return ONLY a valid JSON array:\n'
         f'[{{"question":"...","options":["A","B","C","D"],"answer":0,"explanation":"..."}}]'
     )
     try:
@@ -1080,10 +1164,8 @@ async def pdf_chat(req: PdfChatRequest):
     model = resolve_model(req.model, "pdf")
     pdf_name = req.pdf_name.strip() or "document.pdf"
     logger.info(f"/pdf-chat  model={model}  file={pdf_name!r}  msg={req.message[:80]!r}")
-
     pdf_bytes = _decode_pdf_base64(req.pdf_base64)
     pdf_text, page_count = _validate_and_extract_pdf(pdf_bytes, pdf_name)
-
     MAX_PDF_CHARS = 80_000
     truncation_note = ""
     original_len = len(pdf_text)
@@ -1093,15 +1175,12 @@ async def pdf_chat(req: PdfChatRequest):
             f"\n\n[NOTE: Document was {original_len} chars; showing first {MAX_PDF_CHARS}. "
             f"Later pages may not be shown.]"
         )
-
     refined_message = await refine_prompt(req.message, req.history)
-
     doc_block = (
         f'\n\nDOCUMENT: "{pdf_name}" ({page_count} pages)\n'
         f"=== DOCUMENT START ===\n{pdf_text}{truncation_note}\n=== DOCUMENT END ==="
     )
     messages: list[dict] = [{"role": "system", "content": PDF_SYSTEM_PROMPT + doc_block}]
-
     sanitised: list[dict] = []
     for entry in req.history[-6:]:
         role = entry.role if entry.role in ("user", "assistant") else "user"
@@ -1111,13 +1190,9 @@ async def pdf_chat(req: PdfChatRequest):
             sanitised.append({"role": role, "content": entry.content})
     messages.extend(sanitised)
     messages.append({"role": "user", "content": refined_message})
-
     try:
         response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=32768,
-            temperature=0.3,
+            model=model, messages=messages, max_tokens=32768, temperature=0.3,
         )
     except Exception as e:
         logger.error(f"Groq error /pdf-chat: {e}")
@@ -1125,7 +1200,6 @@ async def pdf_chat(req: PdfChatRequest):
         if rl:
             raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
-
     reply = strip_think_tags(response.choices[0].message.content.strip())
     if not reply:
         reply = "I couldn't generate a response. Please try rephrasing your question."
@@ -1181,11 +1255,9 @@ async def code_questions(req: CodeQuestionsRequest):
 async def generate_notes(req: NotesRequest):
     model = resolve_model(req.model, "notes")
     logger.info(f"/notes  model={model}  topic={req.topic!r}")
-
     topic = req.topic.strip()
     if not topic:
         raise HTTPException(status_code=400, detail="topic must not be empty")
-
     if req.pdf_base64:
         pdf_bytes = _decode_pdf_base64(req.pdf_base64)
         pdf_text, page_count = _validate_and_extract_pdf(pdf_bytes, req.pdf_name or "document.pdf")
@@ -1197,7 +1269,6 @@ async def generate_notes(req: NotesRequest):
         )
     else:
         user_prompt = f'Generate comprehensive study notes on: "{topic}"'
-
     try:
         response = client.chat.completions.create(
             model=model,
@@ -1205,8 +1276,7 @@ async def generate_notes(req: NotesRequest):
                 {"role": "system", "content": NOTES_SYSTEM_PROMPT},
                 {"role": "user",   "content": user_prompt},
             ],
-            max_tokens=32768,
-            temperature=0.5,
+            max_tokens=32768, temperature=0.5,
         )
     except Exception as e:
         logger.error(f"Groq error /notes: {e}")
@@ -1214,7 +1284,6 @@ async def generate_notes(req: NotesRequest):
         if rl:
             raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
-
     notes = strip_think_tags(response.choices[0].message.content.strip())
     logger.info(f"/notes  reply_len={len(notes)}")
     return NotesResponse(notes=notes, topic=topic)
@@ -1226,11 +1295,9 @@ async def generate_notes(req: NotesRequest):
 async def formula_sheet(req: FormulaRequest):
     model = resolve_model(req.model, "formula")
     logger.info(f"/formula-sheet  model={model}  topic={req.topic!r}")
-
     topic = req.topic.strip()
     if not topic:
         raise HTTPException(status_code=400, detail="topic must not be empty")
-
     if req.pdf_base64:
         pdf_bytes = _decode_pdf_base64(req.pdf_base64)
         pdf_text, page_count = _validate_and_extract_pdf(pdf_bytes, req.pdf_name or "document.pdf")
@@ -1242,7 +1309,6 @@ async def formula_sheet(req: FormulaRequest):
         )
     else:
         user_prompt = f'Generate a complete formula and key terms reference sheet for: "{topic}"'
-
     try:
         response = client.chat.completions.create(
             model=model,
@@ -1250,8 +1316,7 @@ async def formula_sheet(req: FormulaRequest):
                 {"role": "system", "content": FORMULA_SYSTEM_PROMPT},
                 {"role": "user",   "content": user_prompt},
             ],
-            max_tokens=32768,
-            temperature=0.3,
+            max_tokens=32768, temperature=0.3,
         )
     except Exception as e:
         logger.error(f"Groq error /formula-sheet: {e}")
@@ -1259,7 +1324,6 @@ async def formula_sheet(req: FormulaRequest):
         if rl:
             raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
-
     sheet = strip_think_tags(response.choices[0].message.content.strip())
     logger.info(f"/formula-sheet  reply_len={len(sheet)}")
     return FormulaResponse(sheet=sheet, topic=topic)
@@ -1271,10 +1335,8 @@ async def formula_sheet(req: FormulaRequest):
 async def flowchart(req: FlowchartRequest):
     model = resolve_model(req.model, "flowchart")
     logger.info(f"/flowchart  model={model}  msg={req.message[:80]!r}")
-
     refined = await refine_prompt(req.message, req.history)
     user_prompt = f"Create a flowchart for: {refined}"
-
     try:
         response = client.chat.completions.create(
             model=model,
@@ -1282,8 +1344,7 @@ async def flowchart(req: FlowchartRequest):
                 {"role": "system", "content": FLOWCHART_SYSTEM_PROMPT},
                 {"role": "user",   "content": user_prompt},
             ],
-            max_tokens=4096,
-            temperature=0.2,
+            max_tokens=4096, temperature=0.2,
         )
     except Exception as e:
         logger.error(f"Groq error /flowchart: {e}")
@@ -1291,12 +1352,9 @@ async def flowchart(req: FlowchartRequest):
         if rl:
             raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
-
     raw = strip_json_fences(response.choices[0].message.content.strip())
-
     try:
         obj = json.loads(raw)
-
         nodes = []
         for n in obj.get("nodes", []):
             if not isinstance(n, dict):
@@ -1312,7 +1370,6 @@ async def flowchart(req: FlowchartRequest):
                 x     = x,
                 y     = y,
             ))
-
         edges = []
         node_ids = {n.id for n in nodes}
         for e in obj.get("edges", []):
@@ -1330,17 +1387,14 @@ async def flowchart(req: FlowchartRequest):
                 back  = bool(e.get("back", False)),
                 bx    = float(e.get("bx", 0)),
             ))
-
         if not nodes:
             raise ValueError("No valid nodes in flowchart response")
-
         logger.info(f"/flowchart  title={obj.get('title','')!r}  nodes={len(nodes)}  edges={len(edges)}")
         return FlowchartResponse(
             title = str(obj.get("title", refined[:50])),
             nodes = nodes,
             edges = edges,
         )
-
     except Exception as e:
         logger.warning(f"/flowchart  parse failed: {e}  raw={raw[:400]!r}")
         raise HTTPException(status_code=422, detail=f"Could not parse flowchart data: {e}")
