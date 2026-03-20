@@ -1435,12 +1435,13 @@ async def flowchart(req: FlowchartRequest):
 # ══════════════════════════════════════════════════════════════════════════════
 # ── /web-search  (auto-detected live queries)
 # ══════════════════════════════════════════════════════════════════════════════
+import asyncio
 
 WEB_SEARCH_SYSTEM = """You are Sedy, an AI study assistant. You have been given live web search results.
 Use ONLY the provided search results to answer the question accurately and concisely.
 Cite sources using [1], [2] etc. where relevant.
 If the results don't answer the question, say so honestly.
-Use markdown formatting. Keep the answer short and student-friendly — max 150 words."""
+Use markdown formatting. Keep the answer short and student-friendly — max 120 words."""
 
 class WebSearchRequest(BaseModel):
     query: str
@@ -1456,6 +1457,59 @@ class WebSearchResponse(BaseModel):
     reply: str
     sources: list[WebSearchSource] = []
     query: str
+    fast: bool = False   # True = answered from answer box, no Groq needed
+
+
+def _parse_serper_response(data: dict) -> tuple[str, list[WebSearchSource], str | None]:
+    """
+    Parse Serper JSON.
+    Returns (search_context, sources, instant_answer_or_None).
+    instant_answer is set when Google provides a direct answer box —
+    in that case we can skip Groq entirely.
+    """
+    sources: list[WebSearchSource] = []
+    snippets: list[str] = []
+    instant_answer: str | None = None
+
+    # ── Answer box — direct answer, no Groq needed ────────────────────────────
+    ab = data.get("answerBox", {})
+    if ab:
+        answer_text = (ab.get("answer") or "").strip()
+        snippet_text = (ab.get("snippet") or "").strip()
+        title_text   = (ab.get("title") or "").strip()
+
+        if answer_text:
+            # Short factual answer — return immediately
+            instant_answer = f"**{answer_text}**"
+            if title_text:
+                instant_answer = f"**{answer_text}**\n\n*{title_text}*"
+            snippets.append(f"[Featured Answer] {answer_text}")
+        elif snippet_text and len(snippet_text) < 300:
+            # Slightly longer snippet — still skip Groq
+            instant_answer = snippet_text
+            snippets.append(f"[Featured Answer] {snippet_text}")
+
+    # ── Knowledge graph ───────────────────────────────────────────────────────
+    kg = data.get("knowledgeGraph", {})
+    if kg.get("description"):
+        snippets.append(f"[Knowledge Panel] {kg['description']}")
+        # If no answer box yet and KG has a clean short description, use it
+        if not instant_answer and len(kg["description"]) < 250:
+            title = kg.get("title", "")
+            instant_answer = f"**{title}**\n\n{kg['description']}" if title else kg["description"]
+
+    # ── Organic results ───────────────────────────────────────────────────────
+    for i, r in enumerate(data.get("organic", [])[:5], 1):
+        title   = r.get("title", "")
+        url     = r.get("link", "")
+        snippet = r.get("snippet", "")
+        domain  = url.split("/")[2] if url else ""
+        favicon = f"https://www.google.com/s2/favicons?domain={domain}&sz=16"
+        if title or snippet:
+            snippets.append(f"[{i}] {title}: {snippet}")
+            sources.append(WebSearchSource(title=title, url=url, snippet=snippet, favicon=favicon))
+
+    return "\n".join(snippets[:8]), sources, instant_answer
 
 
 @app.post("/web-search", response_model=WebSearchResponse)
@@ -1465,72 +1519,66 @@ async def web_search(req: WebSearchRequest):
         raise HTTPException(status_code=400, detail="query must not be empty")
 
     if not SERPER_API_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="Web search is not configured. Set SERPER_API_KEY env var."
-        )
+        raise HTTPException(status_code=503, detail="Web search not configured. Set SERPER_API_KEY.")
 
     logger.info(f"/web-search  query={query[:80]!r}")
 
-    # ── Fetch search results + synthesise answer in PARALLEL ─────────────────
-    sources: list[WebSearchSource] = []
-    search_context = ""
-
+    # ── Step 1: Fire Serper search ────────────────────────────────────────────
+    serper_data: dict = {}
     try:
-        async with httpx.AsyncClient(timeout=6.0) as c:
+        async with httpx.AsyncClient(timeout=5.0) as c:
             resp = await c.post(
                 "https://google.serper.dev/search",
                 headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
                 json={"q": query, "num": 5, "gl": "in", "hl": "en"},
             )
             if resp.status_code == 200:
-                data = resp.json()
-                snippets = []
-
-                # Answer box first — fastest path
-                answer_box = data.get("answerBox", {})
-                if answer_box:
-                    ab = answer_box.get("answer") or answer_box.get("snippet", "")
-                    if ab:
-                        snippets.append(f"[Featured Answer] {ab}")
-
-                # Knowledge panel
-                kg = data.get("knowledgeGraph", {})
-                if kg.get("description"):
-                    snippets.append(f"[Knowledge Panel] {kg['description']}")
-
-                # Organic results
-                for i, r in enumerate(data.get("organic", [])[:5], 1):
-                    title   = r.get("title", "")
-                    url     = r.get("link", "")
-                    snippet = r.get("snippet", "")
-                    domain  = url.split("/")[2] if url else ""
-                    favicon = f"https://www.google.com/s2/favicons?domain={domain}&sz=16"
-                    if title or snippet:
-                        snippets.append(f"[{i}] {title}: {snippet}")
-                        sources.append(WebSearchSource(
-                            title=title, url=url, snippet=snippet, favicon=favicon
-                        ))
-
-                search_context = "\n".join(snippets[:8])   # cap to keep prompt short
+                serper_data = resp.json()
     except Exception as e:
         logger.warning(f"/web-search  serper failed: {e}")
 
-    if not search_context:
+    if not serper_data:
         raise HTTPException(status_code=502, detail="Web search failed. Check SERPER_API_KEY.")
 
-    # ── Groq Flash for speed (3-5x faster than Pro) ───────────────────────────
-    user_content = f"Question: {query}\n\nSearch Results:\n{search_context}\n\nAnswer concisely."
-    try:
-        response = client.chat.completions.create(
-            model=MODELS["flash"],        # ← Flash, not Pro
-            messages=[
-                {"role": "system", "content": WEB_SEARCH_SYSTEM},
-                {"role": "user",   "content": user_content},
-            ],
-            max_tokens=400,               # ← tight cap = fast
-            temperature=0.2,
+    search_context, sources, instant_answer = _parse_serper_response(serper_data)
+
+    # ── Option 1: Answer box hit — return INSTANTLY, skip Groq ───────────────
+    if instant_answer:
+        logger.info(f"/web-search  INSTANT answer box hit, skipping Groq")
+        return WebSearchResponse(
+            reply=instant_answer,
+            sources=sources,
+            query=query,
+            fast=True,
         )
+
+    if not search_context:
+        raise HTTPException(status_code=502, detail="No usable search results returned.")
+
+    # ── Option 2: No instant answer — call Groq Flash in parallel with nothing
+    #    (Serper already finished; we just need Groq now, as fast as possible)
+    # ─────────────────────────────────────────────────────────────────────────
+    user_content = f"Question: {query}\n\nSearch Results:\n{search_context}\n\nAnswer concisely in under 120 words."
+
+    async def call_groq():
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: client.chat.completions.create(
+                model=MODELS["flash"],
+                messages=[
+                    {"role": "system", "content": WEB_SEARCH_SYSTEM},
+                    {"role": "user",   "content": user_content},
+                ],
+                max_tokens=300,
+                temperature=0.15,
+            )
+        )
+
+    try:
+        groq_response = await asyncio.wait_for(call_groq(), timeout=10.0)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Groq timed out. Try again.")
     except Exception as e:
         logger.error(f"Groq error /web-search: {e}")
         rl = parse_rate_limit_error(e)
@@ -1538,6 +1586,6 @@ async def web_search(req: WebSearchRequest):
             raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
 
-    reply = strip_think_tags(response.choices[0].message.content.strip())
+    reply = strip_think_tags(groq_response.choices[0].message.content.strip())
     logger.info(f"/web-search  reply_len={len(reply)}  sources={len(sources)}")
-    return WebSearchResponse(reply=reply, sources=sources, query=query)
+    return WebSearchResponse(reply=reply, sources=sources, query=query, fast=False)
