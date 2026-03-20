@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from groq import Groq
 import json
 import os
@@ -9,13 +9,14 @@ import base64
 import re
 import httpx
 import io
+import asyncio
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 logger = logging.getLogger("sedy")
 
 # ── App ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Sedy API", version="3.7.0")
+app = FastAPI(title="Sedy API", version="4.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,13 +31,16 @@ if not GROQ_API_KEY:
 
 client = Groq(api_key=GROQ_API_KEY)
 
+# ── Serper (web search) ────────────────────────────────────────────────────────
+SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
+
 # ── Available models ───────────────────────────────────────────────────────────
 MODELS = {
     "pro":    "llama-3.3-70b-versatile",
     "flash":  "llama-3.1-8b-instant",
     "smart":  "qwen/qwen3-32b",
     "code":   "deepseek-r1-distill-qwen-32b",
-    "vision": "meta-llama/llama-4-scout-17b-16e-instruct",  # ← NEW: vision model
+    "vision": "meta-llama/llama-4-scout-17b-16e-instruct",
 }
 
 DEFAULT_MODEL = MODELS["pro"]
@@ -53,17 +57,15 @@ AUTO_MODEL_MAP = {
     "flowchart": MODELS["smart"],
     "intent":    MODELS["flash"],
     "refine":    MODELS["flash"],
-    "image":     MODELS["vision"],   # ← NEW: always use vision model for images
+    "image":     MODELS["vision"],
 }
 
 def resolve_model(requested: str | None, task: str = "chat") -> str:
     if task == "image":
-        return MODELS["vision"]   # vision model is fixed for image tasks
+        return MODELS["vision"]
     if not requested or requested == "auto":
         return AUTO_MODEL_MAP.get(task, DEFAULT_MODEL)
     return MODELS.get(requested, DEFAULT_MODEL)
-
-SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 
 # ── PDF Engine Detection ───────────────────────────────────────────────────────
 PDF_ENGINE = None
@@ -75,19 +77,19 @@ except ImportError:
     try:
         from pypdf import PdfReader as _PyPdfReader
         PDF_ENGINE = "pypdf"
-        logger.info("PDF engine: pypdf (no OCR — scanned PDFs will fail)")
+        logger.info("PDF engine: pypdf")
     except ImportError:
         try:
             import pdfplumber as _pdfplumber
             PDF_ENGINE = "pdfplumber"
-            logger.info("PDF engine: pdfplumber (no OCR — scanned PDFs will fail)")
+            logger.info("PDF engine: pdfplumber")
         except ImportError:
             logger.warning("No PDF library found! Install pymupdf: pip install pymupdf")
 
 
 def _ocr_page_fitz(page) -> str:
     try:
-        tp = page.get_textpage_ocr(flags=0, language="eng")
+        tp = page.get_textpage_ocr(flags=0, language="eng+hin+ben+tam+tel+kan+mal+mar+guj+pan+urd+ori")
         return page.get_text(textpage=tp)
     except Exception as e:
         logger.warning(f"OCR failed on page: {e}")
@@ -106,12 +108,11 @@ def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, int]:
                 logger.info(f"Page {i+1} appears image-only — attempting OCR")
                 text = _ocr_page_fitz(page)
             extracted.append(f"\n--- Page {i+1} ---\n{text}")
-        full_text = "\n".join(extracted)
-        return full_text, len(doc)
+        return "\n".join(extracted), len(doc)
     elif PDF_ENGINE == "pypdf":
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(pdf_bytes))
-        pages = reader.pages
+        pages  = reader.pages
         extracted = []
         for i, p in enumerate(pages):
             text = p.extract_text() or ""
@@ -119,33 +120,68 @@ def extract_pdf_text(pdf_bytes: bytes) -> tuple[str, int]:
         full_text = "\n".join(extracted)
         meaningful = len(re.sub(r"[\s\-]", "", full_text))
         if meaningful < 100:
-            logger.warning("pypdf extracted almost no text — PDF is likely scanned.")
+            logger.warning("pypdf extracted almost no text — PDF may be scanned.")
         return full_text, len(pages)
     elif PDF_ENGINE == "pdfplumber":
         import pdfplumber
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            pages = pdf.pages
             text = "\n".join(
                 f"\n--- Page {i+1} ---\n{p.extract_text() or ''}"
-                for i, p in enumerate(pages)
+                for i, p in enumerate(pdf.pages)
             )
-            return text, len(pages)
+            return text, len(pdf.pages)
     else:
         raise RuntimeError(
-            "No PDF library is installed on the server. "
-            "Please install pymupdf: pip install pymupdf"
+            "No PDF library is installed. Please install pymupdf: pip install pymupdf"
         )
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── LANGUAGE SUPPORT CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+
+SUPPORTED_LANGUAGES = """
+SUPPORTED LANGUAGES — detect and respond in the student's language automatically:
+
+Indian Languages:
+- हिंदी (Hindi) — respond fully in Hindi using Devanagari script
+- বাংলা (Bengali) — respond fully in Bengali using Bengali script
+- தமிழ் (Tamil) — respond fully in Tamil using Tamil script
+- తెలుగు (Telugu) — respond fully in Telugu using Telugu script
+- ಕನ್ನಡ (Kannada) — respond fully in Kannada using Kannada script
+- മലയാളം (Malayalam) — respond fully in Malayalam using Malayalam script
+- मराठी (Marathi) — respond fully in Marathi using Devanagari script
+- ગુજરાતી (Gujarati) — respond fully in Gujarati using Gujarati script
+- ਪੰਜਾਬੀ (Punjabi) — respond fully in Punjabi using Gurmukhi script
+- اردو (Urdu) — respond fully in Urdu using Nastaliq/Arabic script
+- ଓଡ଼ିଆ (Odia) — respond fully in Odia using Odia script
+- অসমীয়া (Assamese) — respond fully in Assamese using Bengali script
+- संस्कृत (Sanskrit) — respond fully in Sanskrit using Devanagari script
+- Hinglish — when student mixes Hindi + English, match that style
+
+English:
+- English (default when no other language detected)
+
+LANGUAGE RULES:
+1. ALWAYS detect the student's language from their message
+2. Respond ENTIRELY in that language — do not switch mid-response
+3. Use the correct native script (not romanised transliteration) unless student uses romanised
+4. Math notation ($...$) stays as LaTeX regardless of language
+5. Technical terms (like "algorithm", "photosynthesis") can stay in English within the response
+6. If student code-switches (Hinglish, Tanglish etc.), match their style naturally
+"""
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── SYSTEM PROMPTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT = """You are Sedy, an intelligent student learning assistant made by Ansh Verma, a school student.
+SYSTEM_PROMPT = f"""You are Sedy, an intelligent student learning assistant made by Ansh Verma, a school student.
 You explain concepts clearly and simply, solve math and science problems step by step,
 summarize topics, and help students understand programming.
 Always be encouraging, clear and educational.
 Only reveal your identity when asked.
+
+{SUPPORTED_LANGUAGES}
 
 IMPORTANT RULES:
 - Use markdown formatting: headers (##), bold (**text**), bullet points (- item), code blocks (```language)
@@ -156,14 +192,16 @@ IMPORTANT RULES:
 STRICT MATH FORMATTING (frontend uses KaTeX):
 - ALL math MUST be wrapped in LaTeX: $...$ inline, $$...$$ display
 - NEVER write bare math like w^2 — always wrap in $w^2$
-- Fractions: $\\frac{a}{b}$  Subscripts: $A_{\\text{base}}$"""
+- Fractions: $\\frac{{a}}{{b}}$  Subscripts: $A_{{\\text{{base}}}}$"""
 
-# ── Vision / Image system prompt ──────────────────────────────────────────────
-IMAGE_SYSTEM_PROMPT = """You are Sedy, an intelligent AI study assistant with vision capabilities, made by Ansh Verma.
+IMAGE_SYSTEM_PROMPT = f"""You are Sedy, an intelligent AI study assistant with vision capabilities, made by Ansh Verma.
 The student has shared an image. Look at it VERY carefully and help them understand it completely.
+
+{SUPPORTED_LANGUAGES}
 
 YOUR CAPABILITIES:
 - Read printed text, handwritten text, equations from images
+- Read text in ANY Indian script — Devanagari, Bengali, Tamil, Telugu, Kannada, Malayalam, Gujarati, Gurmukhi, Odia, Urdu
 - Solve math problems shown in images (handwritten or printed)
 - Explain diagrams: biology, chemistry, physics, geography, circuits, flowcharts
 - Describe what is in the image clearly
@@ -171,108 +209,46 @@ YOUR CAPABILITIES:
 - Read question papers, textbook pages, notes, worksheets
 - Identify graphs and explain data trends
 - IDENTIFY LOGOS, EMBLEMS, SEALS, BADGES, SYMBOLS — read every text and visual clue in them
-
-LOGO & EMBLEM IDENTIFICATION — VERY IMPORTANT:
-You are an expert at identifying Indian school, college, government, and institutional logos. When you see a logo or emblem:
-1. READ all text in the image, including Hindi/Sanskrit/regional language text at top, bottom, and sides
-2. LOOK at the central image/symbol carefully — what animal, object, or scene is depicted?
-3. LOOK at the shape: circular seal, shield, badge, etc.
-4. MATCH against your knowledge of Indian institutions
-
-COMMON INDIAN EDUCATIONAL LOGOS you must recognize:
-- **KVS / Kendriya Vidyalaya Sangathan** — circular seal, Sanskrit motto "तत् त्वं पूषन् अपावृणु" (Tat Tvam Pushan Apavrinu), rising sun with rays, tricolor (orange, white, green) stripes at bottom, "केन्द्रीय विद्यालय संगठन" in Hindi, "KENDRIYA VIDYALAYA SANGATHAN" in English
-- **CBSE** — Central Board of Secondary Education, blue logo, open book
-- **NCERT** — National Council of Educational Research and Training, circular seal
-- **NVS / Navodaya Vidyalaya Samiti** — "नवोदय विद्यालय समिति", rising sun
-- **Ministry of Education, Govt of India** — Ashoka Pillar with lions, "शिक्षा मंत्रालय"
-- **IIT logos** — each IIT has unique logos with their city name
-- **University of Delhi** — circular seal with "विद्यया अमृतमश्नुते"
-- **UPSC** — Union Public Service Commission
-- **NEET / JEE logos** — NTA (National Testing Agency)
-- **State board logos** — BSEH, BSEB, Maharashtra Board, UP Board, etc.
-- **Army School / AWES** — Army Welfare Education Society
-- **Sainik School** — "सैनिक स्कूल", Army-related symbols
-- **DAV Schools** — "दयानन्द आर्य वैदिक", Om symbol
-- **DPS / Delhi Public School** — circular logo with lamp
-
-IDENTIFICATION STRATEGY:
-1. First read ALL visible text in the image — this is your #1 clue
-2. If you see "KVS" or "केन्द्रीय विद्यालय" or "Kendriya Vidyalaya" anywhere → it is KVS
-3. If you see the rising sun + tricolor stripes + Sanskrit motto → very likely KVS
-4. State the organization name confidently if you can identify it
-5. Explain what the logo represents: colors, symbols, motto meaning
-6. If you truly cannot identify it with certainty, describe what you see in detail and give your best guess
-
-MULTILINGUAL SUPPORT — VERY IMPORTANT:
-- If the student writes in Hindi, respond FULLY in Hindi (Devanagari script)
-- If the student writes in Bengali (বাংলা), respond fully in Bengali
-- If the student writes in Tamil (தமிழ்), respond fully in Tamil
-- If the student writes in Telugu (తెలుగు), respond fully in Telugu
-- If the student writes in Kannada (ಕನ್ನಡ), respond fully in Kannada
-- If the student writes in Malayalam (മലയാളം), respond fully in Malayalam
-- If the student writes in Marathi (मराठी), respond fully in Marathi
-- If the student writes in Gujarati (ગુજરાતી), respond fully in Gujarati
-- If the student writes in Punjabi (ਪੰਜਾਬੀ), respond fully in Punjabi
-- If the student writes in Urdu, respond fully in Urdu
-- If the student writes in Odia (ଓଡ଼ିଆ), respond fully in Odia
-- If the student writes in Assamese (অসমীয়া), respond fully in Assamese
-- If the student mixes Hindi + English (Hinglish), respond in the same friendly Hinglish style
-- DEFAULT: Respond in the same language the student used in their question
-- If no question is asked (student just sends the image), describe it fully and identify it in English, then ask what they need help with
+- Read Indian textbook pages (NCERT, state board) in any language
 
 FORMAT RULES:
 - Use markdown formatting: ## headers, **bold**, bullet points
 - For math: use LaTeX $...$ inline and $$...$$ display
-- Be thorough and specific — students need real, accurate information
+- Be thorough and specific
 - Be encouraging and friendly"""
 
-REFINE_SYSTEM_PROMPT = """You are a silent prompt refinement engine for a student AI assistant.
-Your job is to rewrite the student's message into a complete, self-contained, unambiguous request
-by using the conversation history as context.
+REFINE_SYSTEM_PROMPT = f"""You are a silent prompt refinement engine for a student AI assistant.
+Rewrite the student's message into a complete, self-contained, unambiguous request
+using the conversation history as context.
+
+{SUPPORTED_LANGUAGES}
 
 RULES:
-1. Fix ALL spelling/typo errors (e.g. "grph" → "graph", "imnports" → "imports")
-2. Fix grammar while keeping casual tone
-3. CRITICAL — resolve ALL vague or incomplete references using history:
-   - "in inr" after a GDP graph → "Show India GDP from 2000 to 2024 as a line graph in INR (Indian Rupees)"
-   - "grph" after a table of data → "Show that data as a proper line graph"
-   - "write answer only" after a math problem → "Give only the final answer to x² + 5x + 6 = 0"
-   - "without any imports" after code → "Rewrite the snake game in Python without using any imports"
-   - "explain more" → "Explain [the last topic discussed] in more detail"
-   - "make it harder" after a quiz → "Make the quiz on [last topic] harder"
-   - "same but for china" → "Show the same [graph/data] for China"
+1. Fix ALL spelling/typo errors — including errors in Indian language text
+2. Fix grammar while keeping casual tone and the student's chosen language
+3. Resolve ALL vague references using history
+4. PDF & DOCUMENT CONTEXT: If history contains a PDF, treat that document as the active topic
+5. TOPIC MEMORY — always carry the last known topic forward
+6. If the message is very short or single word, ALWAYS expand it using context
+7. Replace "it", "this", "that", "same", "above", "यह", "वो", "इसके" with the actual subject from history
+8. Preserve the student's intent AND their chosen language
 
-4. PDF & DOCUMENT CONTEXT (very important):
-   - If the history contains a PDF explanation, summary, or Q&A, treat that document as the active topic.
-   - "make notes on it" after a PDF explanation → "Make study notes on [PDF topic]"
-   - "make a flowchart" after a PDF explanation → "Make a flowchart for [PDF topic]"
-   - "make flashcards" after a PDF → "Make flashcards on [PDF topic]"
-   - "quiz me" after a PDF → "Quiz me on [PDF topic]"
-   - Always extract the actual subject/topic name from the PDF content in history
+Output ONLY the refined message. No explanation, no preamble, no quotes."""
 
-5. TOPIC MEMORY — always carry the last known topic forward:
-   - "explain more" → "Explain [last topic] in more detail"
-   - "give an example" → "Give an example of [last concept discussed]"
-   - "make it simpler" → "Explain [last topic] in simpler terms"
-   - Short follow-ups like "and?" / "more?" / "continue" → "Continue explaining [last topic]"
+GRAPH_REFINE_SYSTEM_PROMPT = f"""You are a silent prompt refinement engine for data visualisation requests.
+Rewrite the user's message into a complete, self-contained graph request using history.
 
-6. If the message is very short or a single word, ALWAYS expand it using context
-7. If the message references "it", "this", "that", "same", "above" — ALWAYS replace with the actual subject from history
-8. Preserve the student's intent — don't change what they're asking for, just make it complete and specific
-
-Output ONLY the refined message. No explanation, no preamble, no quotes around it."""
-
-GRAPH_REFINE_SYSTEM_PROMPT = """You are a silent prompt refinement engine for data visualisation requests.
-Your job is to rewrite the user's message into a complete, self-contained graph request using history.
+{SUPPORTED_LANGUAGES}
 
 RULES:
-1. Fix ALL spelling/typo errors
+1. Fix ALL spelling/typo errors in any language
 2. Resolve ALL vague references using conversation history
 3. Append chart type if implied:
-   - "breakdown/share/proportion/percentage" → append "(pie chart)"
-   - "compare/vs/ranking/top N/countries" → append "(bar chart)"
-   - "over time/trend/history/years/growth" → append "(line chart)"
+   - "breakdown/share/proportion/percentage/हिस्सा/भाग" → append "(pie chart)"
+   - "compare/vs/ranking/top N/countries/तुलना" → append "(bar chart)"
+   - "over time/trend/history/years/growth/समय के साथ" → append "(line chart)"
 4. Always output a COMPLETE graph request with: what to show, time range if any, unit if any, chart type
+5. Output the refined request in English (graph data labels will be in English regardless)
 
 Output ONLY the refined message. No explanation, no preamble."""
 
@@ -352,8 +328,10 @@ LAYOUT RULES:
 
 OUTPUT ONLY THE JSON. Nothing else."""
 
-PDF_SYSTEM_PROMPT = """You are Sedy, an intelligent student learning assistant made by Ansh Verma.
-The user has uploaded a PDF whose FULL TEXT is embedded below between === DOCUMENT START === and === DOCUMENT END ===.
+PDF_SYSTEM_PROMPT = f"""You are Sedy, an intelligent student learning assistant made by Ansh Verma.
+The user has uploaded a PDF whose FULL TEXT is embedded below.
+
+{SUPPORTED_LANGUAGES}
 
 YOUR RULES:
 1. Base ALL answers strictly on the document text provided.
@@ -361,62 +339,67 @@ YOUR RULES:
 3. If asked a question: find the relevant passage and explain it clearly.
 4. If the answer genuinely isn't in the document, say "This topic isn't covered in this PDF."
 5. Use markdown formatting. Use LaTeX for math: $...$ inline, $$...$$ display.
-6. Be thorough — do NOT give short or vague answers."""
+6. Be thorough — do NOT give short or vague answers.
+7. If the PDF contains text in an Indian language, read and respond in that same language."""
 
 INTENT_SYSTEM_PROMPT = """You are an intent classifier for a student learning app.
 Output EXACTLY one word from: graph, flashcard, quiz, both, notes, formula, flowchart, chat
 
 graph     = user EXPLICITLY asks for a chart, graph, plot, bar chart, pie chart, line graph, or data visualisation.
+            Also matches: ग्राफ, चार्ट, গ্রাফ, வரைபடம், గ్రాఫ్
 flashcard = wants flip study cards
+            Also matches: फ्लैशकार्ड, কার্ড, フラッシュカード
 quiz      = wants MCQ quiz
+            Also matches: क्विज़, কুইজ, வினாடி வினா, క్విజ్
 both      = wants flashcards AND a quiz
 notes     = wants structured study notes, revision notes, a summary in note form, key points as notes
+            Also matches: नोट्स, টীকা, குறிப்புகள், నోట్స్
 formula   = wants a formula sheet, key terms, definitions list, cheat sheet, or terminology reference
+            Also matches: सूत्र, সূত্র, சூத்திரம், సూత్రాలు
 flowchart = user asks for a flowchart, flow diagram, process diagram, diagram of a process
+            Also matches: फ्लोचार्ट, প্রবাহচিত্র, ஓட்டப்படம்
 chat      = everything else
-
-CONTEXT-AWARE FOLLOW-UP RULES:
-- "make notes on it" after ANY topic or PDF → notes
-- "make a flowchart" after ANY topic or PDF → flowchart
-- "make flashcards" after ANY topic or PDF → flashcard
-- "quiz me" after ANY topic or PDF → quiz
-- "formula sheet" after ANY topic or PDF → formula
 
 CRITICAL:
 - Math questions, explanations, "solve this" → chat
 - Only "graph" if user literally asks for a chart
 - Only "flowchart" if user wants a visual process diagram
+- Works for ALL languages: English, Hindi, Bengali, Tamil, Telugu, Kannada, Malayalam, Marathi, Gujarati, Punjabi, Urdu, Odia
 
 No punctuation, no explanation. One word only."""
 
-NOTES_SYSTEM_PROMPT = """You are Sedy, an expert study notes writer for students made by Ansh Verma.
+NOTES_SYSTEM_PROMPT = f"""You are Sedy, an expert study notes writer for students made by Ansh Verma.
 Generate comprehensive, well-structured study notes on the given topic.
 
+{SUPPORTED_LANGUAGES}
+
 FORMAT RULES:
-1. Start with a one-line topic title as ## heading
+1. Start with a one-line topic title as ## heading (in the student's language)
 2. Use ## for major sections, ### for sub-sections
 3. Use bullet points (- ) for key facts under each section
 4. Bold (**term**) all key terms when first introduced
 5. Use LaTeX for ALL math: $...$ inline, $$...$$ display
-6. End with a ## Key Takeaways section with 4-6 bullet points
+6. End with a ## Key Takeaways section (or equivalent in the student's language) with 4-6 bullet points
 7. Be comprehensive — cover ALL important aspects
+8. If topic is from Indian curriculum (NCERT, state board), align with that syllabus
 
 Do NOT add preamble. Start directly with the ## heading."""
 
-FORMULA_SYSTEM_PROMPT = """You are Sedy, an expert at creating formula and key terms reference sheets for students made by Ansh Verma.
+FORMULA_SYSTEM_PROMPT = f"""You are Sedy, an expert at creating formula and key terms reference sheets for students made by Ansh Verma.
 Generate a complete reference sheet for the given topic.
 
+{SUPPORTED_LANGUAGES}
+
 FORMAT RULES:
-1. Start with ## [Topic] — Formula & Key Terms Sheet
+1. Start with ## [Topic] — Formula & Key Terms Sheet (in the student's language)
 2. Split into two sections:
-   ### 📐 Formulas & Equations
+   ### Formulas & Equations
    - Each formula: **Name**: $formula$ — brief explanation
-
-   ### 📖 Key Terms & Definitions
+   ### Key Terms & Definitions
    - Each term: **Term** — clear, concise definition
-
 3. Cover EVERY important formula and term
 4. Order from basic to advanced
+5. Include Indian unit standards where applicable (SI units, rupees, etc.)
 
 Do NOT add preamble. Start directly with the ## heading."""
 
@@ -437,6 +420,14 @@ FORMAT:
   {{"question": "Question text?", "options": ["Option A", "Option B", "Option C"]}},
   {{"question": "Another question?", "options": ["Option A", "Option B", "Option C", "Option D"]}}
 ]"""
+
+WEB_SEARCH_SYSTEM = f"""You are Sedy, an AI study assistant. You have been given live web search results.
+Use ONLY the provided search results to answer the question accurately and concisely.
+Cite sources using [1], [2] etc. where relevant.
+If the results don't answer the question, say so honestly.
+Use markdown formatting. Keep the answer short and student-friendly — max 120 words.
+
+{SUPPORTED_LANGUAGES}"""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -499,39 +490,20 @@ class IntentRequest(BaseModel):
 class CodeQuestionsRequest(BaseModel):
     message: str
 
-# ── NEW: Image chat request ────────────────────────────────────────────────────
 class ImageChatRequest(BaseModel):
-    message: str = ""           # optional — student's question about the image
-    images: list[str]           # list of base64 image strings (with or without data URI prefix)
-    image_names: list[str] = [] # optional filenames for display
+    message: str = ""
+    images: list[str]
+    image_names: list[str] = []
     history: list[HistoryEntry] = []
 
-# ── Flowchart models ───────────────────────────────────────────────────────────
 class FlowchartRequest(BaseModel):
     message: str
     history: list[HistoryEntry] = []
     model: str = "auto"
 
-class FlowchartNode(BaseModel):
-    id: str
-    label: str
-    sub: str = ""
-    shape: str = "rect"
-    col: str = "blue"
-    x: float = 0
-    y: float = 0
-
-class FlowchartEdge(BaseModel):
-    f: str
-    t: str
-    label: str = ""
-    back: bool = False
-    bx: float = 0
-
-class FlowchartResponse(BaseModel):
-    title: str
-    nodes: list[FlowchartNode]
-    edges: list[FlowchartEdge]
+class WebSearchRequest(BaseModel):
+    query: str
+    history: list[HistoryEntry] = []
 
 # ── Response models ────────────────────────────────────────────────────────────
 class ChatResponse(BaseModel):
@@ -599,25 +571,55 @@ class CodeQuestion(BaseModel):
 class CodeQuestionsResponse(BaseModel):
     questions: list[CodeQuestion]
 
+class FlowchartNode(BaseModel):
+    id: str
+    label: str
+    sub: str = ""
+    shape: str = "rect"
+    col: str = "blue"
+    x: float = 0
+    y: float = 0
+
+class FlowchartEdge(BaseModel):
+    f: str
+    t: str
+    label: str = ""
+    back: bool = False
+    bx: float = 0
+
+class FlowchartResponse(BaseModel):
+    title: str
+    nodes: list[FlowchartNode]
+    edges: list[FlowchartEdge]
+
+class WebSearchSource(BaseModel):
+    title: str
+    url: str
+    snippet: str = ""
+    favicon: str = ""
+
+class WebSearchResponse(BaseModel):
+    reply: str
+    sources: list[WebSearchSource] = []
+    query: str
+    fast: bool = False
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_rate_limit_error(exc: Exception) -> dict | None:
-    import re as _re
     msg = str(exc)
     if "429" not in msg and "rate_limit" not in msg.lower():
         return None
     wait_sec = 0
-    wait_str = ""
-    m = _re.search(r'try again in\s+([\dhms. ]+)', msg, _re.I)
+    m = re.search(r'try again in\s+([\dhms. ]+)', msg, re.I)
     if m:
         raw = m.group(1).strip()
-        wait_str = raw
-        hours   = sum(float(x) for x in _re.findall(r'([\d.]+)h', raw))
-        minutes = sum(float(x) for x in _re.findall(r'([\d.]+)m', raw))
-        seconds = sum(float(x) for x in _re.findall(r'([\d.]+)s', raw))
+        hours   = sum(float(x) for x in re.findall(r'([\d.]+)h', raw))
+        minutes = sum(float(x) for x in re.findall(r'([\d.]+)m', raw))
+        seconds = sum(float(x) for x in re.findall(r'([\d.]+)s', raw))
         wait_sec = int(hours * 3600 + minutes * 60 + seconds)
     limit_type = "tokens"
     if "tokens per minute" in msg.lower() or "TPM" in msg:
@@ -626,14 +628,13 @@ def parse_rate_limit_error(exc: Exception) -> dict | None:
         limit_type = "TPD"
     elif "requests per minute" in msg.lower() or "RPM" in msg:
         limit_type = "RPM"
-    used  = 0
-    limit = 0
-    mu = _re.search(r'Used\s+([\d,]+)', msg)
-    ml = _re.search(r'Limit\s+([\d,]+)', msg)
-    if mu: used  = int(mu.group(1).replace(',',''))
-    if ml: limit = int(ml.group(1).replace(',',''))
+    used, limit = 0, 0
+    mu = re.search(r'Used\s+([\d,]+)', msg)
+    ml = re.search(r'Limit\s+([\d,]+)', msg)
+    if mu: used  = int(mu.group(1).replace(',', ''))
+    if ml: limit = int(ml.group(1).replace(',', ''))
     return {
-        "type": "rate_limit", "wait_seconds": wait_sec, "wait_display": wait_str,
+        "type": "rate_limit", "wait_seconds": wait_sec,
         "limit_type": limit_type, "used": used, "limit": limit,
     }
 
@@ -682,11 +683,31 @@ def strip_json_fences(raw: str) -> str:
 
 
 VAGUE_TOPIC_SIGNALS = [
+    # English
     "it","this","that","them","same","the same","the topic","same topic",
     "this topic","that topic","above","the above","this one","that one",
     "at this basis","based on this","based on that","on this","on that",
-    "from this","from above","as discussed","as mentioned","as explained",
-    "what we discussed","what i said","previous","last topic",
+    # Hindi
+    "यह","वो","वह","इसके","उसके","यही","वही","इस पर","उस पर","इसी","उसी",
+    "यह topic","वह topic","इस विषय","उस विषय","यही विषय",
+    # Bengali
+    "এটা","এটি","এই","ওটা","ওটি","একই","এই বিষয়","ওই বিষয়",
+    # Tamil
+    "இது","அது","இதே","அதே","இந்த topic","அந்த topic",
+    # Telugu
+    "ఇది","అది","ఇదే","అదే","ఈ topic","ఆ topic",
+    # Kannada
+    "ಇದು","ಅದು","ಇದೇ","ಅದೇ",
+    # Malayalam
+    "ഇത്","അത്","ഇതേ","അതേ",
+    # Marathi
+    "हे","ते","हेच","तेच","याच","त्याच",
+    # Gujarati
+    "આ","તે","આ જ","તે જ",
+    # Punjabi
+    "ਇਹ","ਉਹ","ਇਹੀ","ਉਹੀ",
+    # Urdu
+    "یہ","وہ","اسی","اسی موضوع",
 ]
 
 def is_vague_topic(topic: str) -> bool:
@@ -702,10 +723,10 @@ def resolve_topic_from_history(raw_topic: str, history: list[HistoryEntry]) -> s
     rev = list(reversed(history))
     for entry in rev:
         if entry.role == "assistant":
-            m = re.search(r'(?:flashcards?|quiz)\s+(?:about|on)\s+([^\n.!?]{3,60})', entry.content, re.I)
+            m = re.search(r'(?:flashcards?|quiz|फ्लैशकार्ड|क्विज़|কার্ড|কুইজ)\s+(?:about|on|के बारे में|पर|সম্পর্কে)\s+([^\n.!?]{3,60})', entry.content, re.I)
             if m:
                 return m.group(1).strip()
-    action_words = r'flashcards?|flash\s*cards?|quiz(zes)?|make|create|generate|about|on|me|test|cards?|and\b|a\b|the\b'
+    action_words = r'flashcards?|flash\s*cards?|quiz(zes)?|make|create|generate|about|on|me|test|cards?|and\b|a\b|the\b|फ्लैशकार्ड|क्विज़|बनाओ|दो|करो|নিয়ে|বিষয়ে|সম্পর্কে'
     for entry in rev:
         if entry.role == "user":
             cleaned = re.sub(action_words, '', entry.content, flags=re.I).strip()
@@ -713,7 +734,7 @@ def resolve_topic_from_history(raw_topic: str, history: list[HistoryEntry]) -> s
                 return cleaned
     for entry in rev:
         if entry.role == "assistant":
-            m = re.search(r'(?:^|\n)#{1,3}\s+(?:introduction to\s+)?([A-Za-z][^\n]{2,50})', entry.content, re.I)
+            m = re.search(r'(?:^|\n)#{1,3}\s+(?:introduction to\s+)?([A-Za-z\u0900-\u097F\u0980-\u09FF\u0A00-\u0A7F\u0B00-\u0B7F\u0C00-\u0C7F\u0D00-\u0D7F][^\n]{2,50})', entry.content, re.I)
             if m:
                 return m.group(1).strip()
     return raw_topic
@@ -725,7 +746,8 @@ async def refine_prompt(message: str, history: list[HistoryEntry],
         return message
     msg = message.strip()
     if len(msg) > 200 and ' ' in msg and not any(
-        vague in msg.lower() for vague in ['in inr', 'in usd', 'same for', 'make it', 'show it', 'as graph', 'grph']
+        vague in msg.lower() for vague in ['in inr', 'in usd', 'same for', 'make it', 'show it', 'as graph', 'grph',
+                                            'इसके लिए', 'वही', 'उसी', 'একই', 'அதே', 'అదే']
     ):
         return message
     history_snippet = ""
@@ -767,7 +789,7 @@ async def fetch_live_data(query: str) -> str:
             resp = await c.post(
                 "https://google.serper.dev/search",
                 headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-                json={"q": query, "num": 5},
+                json={"q": query, "num": 5, "gl": "in", "hl": "en"},
             )
             if resp.status_code != 200:
                 return ""
@@ -796,11 +818,11 @@ def _validate_and_extract_pdf(pdf_bytes: bytes, pdf_name: str) -> tuple[str, int
     if not pdf_bytes.startswith(b"%PDF"):
         raise HTTPException(
             status_code=400,
-            detail="The uploaded file does not appear to be a valid PDF (missing %PDF header).",
+            detail="The uploaded file does not appear to be a valid PDF.",
         )
     try:
         pdf_text, page_count = extract_pdf_text(pdf_bytes)
-        logger.info(f"Extracted {len(pdf_text)} chars from {page_count} pages ({pdf_name}), engine={PDF_ENGINE}")
+        logger.info(f"Extracted {len(pdf_text)} chars from {page_count} pages ({pdf_name})")
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except Exception as exc:
@@ -808,31 +830,17 @@ def _validate_and_extract_pdf(pdf_bytes: bytes, pdf_name: str) -> tuple[str, int
     if not pdf_text.strip():
         raise HTTPException(
             status_code=422,
-            detail=(
-                "This PDF appears to be image-only (scanned) and no text could be extracted. "
-                + ("Install pymupdf for OCR support." if PDF_ENGINE != "pymupdf" else
-                   "OCR was attempted but produced no output — the PDF may be corrupted.")
-            ),
+            detail="This PDF appears to be image-only and no text could be extracted.",
         )
     return pdf_text, page_count
 
 
-# ── NEW: Image base64 helper ───────────────────────────────────────────────────
 def _prepare_image_url(raw_b64: str) -> str:
-    """
-    Ensure the image is a proper data URI for the vision API.
-    Accepts: raw base64 string, or existing data:image/...;base64,... URI.
-    Returns: data URI string ready to pass to Groq vision API.
-    """
     raw_b64 = raw_b64.strip().replace("\n", "").replace("\r", "").replace(" ", "")
-
-    # Already a data URI — return as-is
     if raw_b64.startswith("data:image/"):
         return raw_b64
-
-    # Detect image type from magic bytes
     try:
-        img_bytes = base64.b64decode(raw_b64[:64])  # just first bytes to detect type
+        img_bytes = base64.b64decode(raw_b64[:64])
         if img_bytes[:2] == b'\xff\xd8':
             mime = "image/jpeg"
         elif img_bytes[:8] == b'\x89PNG\r\n\x1a\n':
@@ -842,10 +850,9 @@ def _prepare_image_url(raw_b64: str) -> str:
         elif img_bytes[:4] == b'RIFF' and img_bytes[8:12] == b'WEBP':
             mime = "image/webp"
         else:
-            mime = "image/jpeg"  # default fallback
+            mime = "image/jpeg"
     except Exception:
         mime = "image/jpeg"
-
     return f"data:{mime};base64,{raw_b64}"
 
 
@@ -856,22 +863,27 @@ def _prepare_image_url(raw_b64: str) -> str:
 @app.get("/")
 async def root():
     return {
-        "status": "Sedy API is live 🚀",
-        "version": "3.7.0",
-        "pdf_engine": PDF_ENGINE or "none — install pymupdf!",
-        "ocr_support": PDF_ENGINE == "pymupdf",
+        "status":       "Sedy API is live 🚀",
+        "version":      "4.0.0",
+        "pdf_engine":   PDF_ENGINE or "none — install pymupdf!",
+        "ocr_support":  PDF_ENGINE == "pymupdf",
         "vision_model": MODELS["vision"],
-        "live_data": bool(SERPER_API_KEY),
+        "tts":          "client-side (Kokoro ONNX / ElevenLabs)",
+        "live_data":    bool(SERPER_API_KEY),
+        "languages":    [
+            "English", "Hindi", "Bengali", "Tamil", "Telugu", "Kannada",
+            "Malayalam", "Marathi", "Gujarati", "Punjabi", "Urdu", "Odia",
+            "Assamese", "Sanskrit", "Hinglish"
+        ],
         "endpoints": [
             "/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat",
             "/intent", "/code-questions", "/notes", "/formula-sheet",
-            "/flowchart", "/image-chat",
+            "/flowchart", "/image-chat", "/web-search",
         ],
     }
 
 
 # ── /intent ────────────────────────────────────────────────────────────────────
-
 @app.post("/intent", response_model=IntentResponse)
 async def detect_intent(req: IntentRequest):
     logger.info(f"/intent  msg={req.message[:80]!r}")
@@ -900,7 +912,6 @@ async def detect_intent(req: IntentRequest):
 
 
 # ── /chat ──────────────────────────────────────────────────────────────────────
-
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     model = resolve_model(req.model, "chat")
@@ -922,49 +933,29 @@ async def chat(req: ChatRequest):
     return ChatResponse(reply=reply)
 
 
-# ── NEW: /image-chat ───────────────────────────────────────────────────────────
-
+# ── /image-chat ────────────────────────────────────────────────────────────────
 @app.post("/image-chat", response_model=ImageChatResponse)
 async def image_chat(req: ImageChatRequest):
-    """
-    Vision endpoint — accepts 1-5 images as base64 strings + an optional question.
-    Uses Llama 4 Scout (meta-llama/llama-4-scout-17b-16e-instruct) on Groq.
-    Responds in whatever Indian language the student used in their question.
-    """
     if not req.images:
         raise HTTPException(status_code=400, detail="At least one image is required.")
-
-    # Cap at 5 images (model limit)
     images = req.images[:5]
     image_count = len(images)
-
     logger.info(f"/image-chat  images={image_count}  msg={req.message[:80]!r}")
-
-    # Build the user content block with image(s) + text
     content: list[dict] = []
-
     for i, raw_b64 in enumerate(images):
         try:
             image_url = _prepare_image_url(raw_b64)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid image {i+1}: {e}")
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": image_url},
-        })
-
-    # Attach the student's question (or a default prompt if none)
+        content.append({"type": "image_url", "image_url": {"url": image_url}})
     question = req.message.strip() if req.message.strip() else (
         "Please look at this image carefully and describe what you see. "
-        "If it contains any text, equations, diagrams or problems, explain them clearly. "
-        "Then ask me what I need help with."
+        "If it contains any text (including in Indian languages), equations, diagrams or problems, "
+        "explain them clearly. If the text is in Hindi, Bengali, Tamil, Telugu or any other Indian "
+        "language, read it and respond in that same language."
     )
     content.append({"type": "text", "text": question})
-
-    # Build message list — include recent history as text only
     messages: list[dict] = [{"role": "system", "content": IMAGE_SYSTEM_PROMPT}]
-
-    # Add last 6 history turns as plain text (no images in history)
     sanitised: list[dict] = []
     for entry in req.history[-6:]:
         role = entry.role if entry.role in ("user", "assistant") else "user"
@@ -973,16 +964,10 @@ async def image_chat(req: ImageChatRequest):
         else:
             sanitised.append({"role": role, "content": entry.content})
     messages.extend(sanitised)
-
-    # The actual image + question turn
     messages.append({"role": "user", "content": content})
-
     try:
         response = client.chat.completions.create(
-            model=MODELS["vision"],
-            messages=messages,
-            max_tokens=4096,
-            temperature=0.4,
+            model=MODELS["vision"], messages=messages, max_tokens=4096, temperature=0.4,
         )
     except Exception as e:
         logger.error(f"Groq error /image-chat: {e}")
@@ -990,17 +975,14 @@ async def image_chat(req: ImageChatRequest):
         if rl:
             raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq vision API error: {e}")
-
     reply = strip_think_tags(response.choices[0].message.content.strip())
     if not reply:
         reply = "I could see the image but couldn't generate a response. Please try again."
-
     logger.info(f"/image-chat  reply_len={len(reply)}")
     return ImageChatResponse(reply=reply, image_count=image_count)
 
 
 # ── /flashcards ────────────────────────────────────────────────────────────────
-
 @app.post("/flashcards", response_model=FlashcardResponse)
 async def flashcards(req: FlashcardRequest):
     model = resolve_model(req.model, "flashcard")
@@ -1014,18 +996,26 @@ async def flashcards(req: FlashcardRequest):
         raise HTTPException(status_code=400, detail="topic must not be empty")
     auto_count = req.count == 0
     count = max(1, min(req.count, 50)) if not auto_count else 0
-    if not auto_count:
-        count_instr = f"Generate exactly {count} flashcards"
-    else:
-        count_instr = (
-            "Decide for yourself how many flashcards are needed to fully cover every "
-            "important concept in this topic. "
-            "Simple/narrow topics need 8-12 cards; broad topics need 15-30 cards."
-        )
+    count_instr = (
+        f"Generate exactly {count} flashcards"
+        if not auto_count else
+        "Decide how many flashcards are needed to fully cover every important concept. "
+        "Simple topics: 8-12 cards. Broad topics: 15-30 cards."
+    )
+
+    # Detect language from topic for consistent output
+    lang_instruction = (
+        "IMPORTANT: Generate the flashcard questions and answers in the same language "
+        "as the topic/request. If the topic is in Hindi, write in Hindi. "
+        "If in Bengali, write in Bengali. If in Tamil, write in Tamil. Etc. "
+        "Default to English if the language is unclear."
+    )
+
     user_prompt = (
         f'{count_instr} about "{topic}".\n'
+        f'{lang_instruction}\n'
         f'Each card must cover a distinct concept — no duplicates.\n'
-        f'Return ONLY a valid JSON array, no markdown, no extra text:\n'
+        f'Return ONLY a valid JSON array:\n'
         f'[{{"question":"...","answer":"..."}}]'
     )
     try:
@@ -1058,7 +1048,6 @@ async def flashcards(req: FlashcardRequest):
 
 
 # ── /quiz ──────────────────────────────────────────────────────────────────────
-
 @app.post("/quiz", response_model=QuizResponse)
 async def quiz(req: QuizRequest):
     model = resolve_model(req.model, "quiz")
@@ -1073,15 +1062,20 @@ async def quiz(req: QuizRequest):
     difficulty = req.difficulty if req.difficulty in ("easy", "medium", "hard") else "medium"
     auto_count = req.count == 0
     count = max(1, min(req.count, 50)) if not auto_count else 0
-    if not auto_count:
-        count_instr = f"Generate exactly {count} {difficulty} MCQ questions"
-    else:
-        count_instr = (
-            f"Decide for yourself how many {difficulty} MCQ questions are needed to "
-            f"properly test every important concept in this topic."
-        )
+    count_instr = (
+        f"Generate exactly {count} {difficulty} MCQ questions"
+        if not auto_count else
+        f"Decide how many {difficulty} MCQ questions are needed to properly test every concept."
+    )
+
+    lang_instruction = (
+        "IMPORTANT: Generate the quiz questions, options, and explanations in the same language "
+        "as the topic/request. Match the student's language exactly."
+    )
+
     user_prompt = (
         f'{count_instr} about "{topic}".\n'
+        f'{lang_instruction}\n'
         f'Each question must test a different concept — no duplicates.\n'
         f'Return ONLY a valid JSON array:\n'
         f'[{{"question":"...","options":["A","B","C","D"],"answer":0,"explanation":"..."}}]'
@@ -1127,7 +1121,6 @@ async def quiz(req: QuizRequest):
 
 
 # ── /graph ─────────────────────────────────────────────────────────────────────
-
 @app.post("/graph", response_model=GraphResponse)
 async def graph(req: GraphRequest):
     model = resolve_model(req.model, "graph")
@@ -1190,7 +1183,6 @@ async def graph(req: GraphRequest):
 
 
 # ── /pdf-chat ──────────────────────────────────────────────────────────────────
-
 @app.post("/pdf-chat", response_model=PdfChatResponse)
 async def pdf_chat(req: PdfChatRequest):
     model = resolve_model(req.model, "pdf")
@@ -1240,7 +1232,6 @@ async def pdf_chat(req: PdfChatRequest):
 
 
 # ── /code-questions ────────────────────────────────────────────────────────────
-
 @app.post("/code-questions", response_model=CodeQuestionsResponse)
 async def code_questions(req: CodeQuestionsRequest):
     logger.info(f"/code-questions  msg={req.message[:80]!r}")
@@ -1277,12 +1268,11 @@ async def code_questions(req: CodeQuestionsRequest):
         logger.info(f"/code-questions  generated {len(questions)} questions")
         return CodeQuestionsResponse(questions=questions)
     except Exception as e:
-        logger.warning(f"/code-questions  parse failed: {e}  raw={raw[:200]!r}")
+        logger.warning(f"/code-questions  parse failed: {e}")
         return CodeQuestionsResponse(questions=[])
 
 
 # ── /notes ─────────────────────────────────────────────────────────────────────
-
 @app.post("/notes", response_model=NotesResponse)
 async def generate_notes(req: NotesRequest):
     model = resolve_model(req.model, "notes")
@@ -1322,7 +1312,6 @@ async def generate_notes(req: NotesRequest):
 
 
 # ── /formula-sheet ─────────────────────────────────────────────────────────────
-
 @app.post("/formula-sheet", response_model=FormulaResponse)
 async def formula_sheet(req: FormulaRequest):
     model = resolve_model(req.model, "formula")
@@ -1362,13 +1351,19 @@ async def formula_sheet(req: FormulaRequest):
 
 
 # ── /flowchart ─────────────────────────────────────────────────────────────────
-
 @app.post("/flowchart", response_model=FlowchartResponse)
 async def flowchart(req: FlowchartRequest):
     model = resolve_model(req.model, "flowchart")
     logger.info(f"/flowchart  model={model}  msg={req.message[:80]!r}")
     refined = await refine_prompt(req.message, req.history)
-    user_prompt = f"Create a flowchart for: {refined}"
+    # Flowchart node labels must be short — instruct model to use English or transliterated
+    # labels for the SVG nodes, since SVG renders all scripts fine
+    user_prompt = (
+        f"Create a flowchart for: {refined}\n\n"
+        "NOTE: Node labels in the JSON can be in the same language as the request "
+        "(Hindi/Bengali/Tamil etc.) — use short native-script labels where appropriate. "
+        "Keep each label under 25 characters."
+    )
     try:
         response = client.chat.completions.create(
             model=model,
@@ -1399,8 +1394,7 @@ async def flowchart(req: FlowchartRequest):
                 sub   = str(n.get("sub", ""))[:30],
                 shape = n.get("shape", "rect") if n.get("shape") in ("oval","rect","diamond","para") else "rect",
                 col   = n.get("col", "blue") if n.get("col") in ("gray","blue","teal","amber","green","coral","purple") else "blue",
-                x     = x,
-                y     = y,
+                x=x, y=y,
             ))
         edges = []
         node_ids = {n.id for n in nodes}
@@ -1410,95 +1404,52 @@ async def flowchart(req: FlowchartRequest):
             f_id = str(e.get("f", ""))
             t_id = str(e.get("t", ""))
             if f_id not in node_ids or t_id not in node_ids:
-                logger.warning(f"/flowchart  skipping edge {f_id}→{t_id} — node not found")
                 continue
             edges.append(FlowchartEdge(
-                f     = f_id,
-                t     = t_id,
-                label = str(e.get("label", ""))[:15],
-                back  = bool(e.get("back", False)),
-                bx    = float(e.get("bx", 0)),
+                f=f_id, t=t_id,
+                label=str(e.get("label", ""))[:15],
+                back=bool(e.get("back", False)),
+                bx=float(e.get("bx", 0)),
             ))
         if not nodes:
             raise ValueError("No valid nodes in flowchart response")
         logger.info(f"/flowchart  title={obj.get('title','')!r}  nodes={len(nodes)}  edges={len(edges)}")
         return FlowchartResponse(
-            title = str(obj.get("title", refined[:50])),
-            nodes = nodes,
-            edges = edges,
+            title=str(obj.get("title", refined[:50])),
+            nodes=nodes, edges=edges,
         )
     except Exception as e:
-        logger.warning(f"/flowchart  parse failed: {e}  raw={raw[:400]!r}")
+        logger.warning(f"/flowchart  parse failed: {e}")
         raise HTTPException(status_code=422, detail=f"Could not parse flowchart data: {e}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── /web-search  (auto-detected live queries)
-# ══════════════════════════════════════════════════════════════════════════════
-import asyncio
-
-WEB_SEARCH_SYSTEM = """You are Sedy, an AI study assistant. You have been given live web search results.
-Use ONLY the provided search results to answer the question accurately and concisely.
-Cite sources using [1], [2] etc. where relevant.
-If the results don't answer the question, say so honestly.
-Use markdown formatting. Keep the answer short and student-friendly — max 120 words."""
-
-class WebSearchRequest(BaseModel):
-    query: str
-    history: list[HistoryEntry] = []
-
-class WebSearchSource(BaseModel):
-    title: str
-    url: str
-    snippet: str = ""
-    favicon: str = ""
-
-class WebSearchResponse(BaseModel):
-    reply: str
-    sources: list[WebSearchSource] = []
-    query: str
-    fast: bool = False   # True = answered from answer box, no Groq needed
-
-
+# ── /web-search ────────────────────────────────────────────────────────────────
 def _parse_serper_response(data: dict) -> tuple[str, list[WebSearchSource], str | None]:
-    """
-    Parse Serper JSON.
-    Returns (search_context, sources, instant_answer_or_None).
-    instant_answer is set when Google provides a direct answer box —
-    in that case we can skip Groq entirely.
-    """
     sources: list[WebSearchSource] = []
     snippets: list[str] = []
     instant_answer: str | None = None
 
-    # ── Answer box — direct answer, no Groq needed ────────────────────────────
     ab = data.get("answerBox", {})
     if ab:
-        answer_text = (ab.get("answer") or "").strip()
+        answer_text  = (ab.get("answer") or "").strip()
         snippet_text = (ab.get("snippet") or "").strip()
         title_text   = (ab.get("title") or "").strip()
-
         if answer_text:
-            # Short factual answer — return immediately
             instant_answer = f"**{answer_text}**"
             if title_text:
                 instant_answer = f"**{answer_text}**\n\n*{title_text}*"
             snippets.append(f"[Featured Answer] {answer_text}")
         elif snippet_text and len(snippet_text) < 300:
-            # Slightly longer snippet — still skip Groq
             instant_answer = snippet_text
             snippets.append(f"[Featured Answer] {snippet_text}")
 
-    # ── Knowledge graph ───────────────────────────────────────────────────────
     kg = data.get("knowledgeGraph", {})
     if kg.get("description"):
         snippets.append(f"[Knowledge Panel] {kg['description']}")
-        # If no answer box yet and KG has a clean short description, use it
         if not instant_answer and len(kg["description"]) < 250:
             title = kg.get("title", "")
             instant_answer = f"**{title}**\n\n{kg['description']}" if title else kg["description"]
 
-    # ── Organic results ───────────────────────────────────────────────────────
     for i, r in enumerate(data.get("organic", [])[:5], 1):
         title   = r.get("title", "")
         url     = r.get("link", "")
@@ -1517,13 +1468,10 @@ async def web_search(req: WebSearchRequest):
     query = req.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail="query must not be empty")
-
     if not SERPER_API_KEY:
         raise HTTPException(status_code=503, detail="Web search not configured. Set SERPER_API_KEY.")
-
     logger.info(f"/web-search  query={query[:80]!r}")
 
-    # ── Step 1: Fire Serper search ────────────────────────────────────────────
     serper_data: dict = {}
     try:
         async with httpx.AsyncClient(timeout=5.0) as c:
@@ -1538,26 +1486,17 @@ async def web_search(req: WebSearchRequest):
         logger.warning(f"/web-search  serper failed: {e}")
 
     if not serper_data:
-        raise HTTPException(status_code=502, detail="Web search failed. Check SERPER_API_KEY.")
+        raise HTTPException(status_code=502, detail="Web search failed.")
 
     search_context, sources, instant_answer = _parse_serper_response(serper_data)
 
-    # ── Option 1: Answer box hit — return INSTANTLY, skip Groq ───────────────
     if instant_answer:
-        logger.info(f"/web-search  INSTANT answer box hit, skipping Groq")
-        return WebSearchResponse(
-            reply=instant_answer,
-            sources=sources,
-            query=query,
-            fast=True,
-        )
+        logger.info(f"/web-search  INSTANT answer box hit")
+        return WebSearchResponse(reply=instant_answer, sources=sources, query=query, fast=True)
 
     if not search_context:
         raise HTTPException(status_code=502, detail="No usable search results returned.")
 
-    # ── Option 2: No instant answer — call Groq Flash in parallel with nothing
-    #    (Serper already finished; we just need Groq now, as fast as possible)
-    # ─────────────────────────────────────────────────────────────────────────
     user_content = f"Question: {query}\n\nSearch Results:\n{search_context}\n\nAnswer concisely in under 120 words."
 
     async def call_groq():
@@ -1570,8 +1509,7 @@ async def web_search(req: WebSearchRequest):
                     {"role": "system", "content": WEB_SEARCH_SYSTEM},
                     {"role": "user",   "content": user_content},
                 ],
-                max_tokens=300,
-                temperature=0.15,
+                max_tokens=300, temperature=0.15,
             )
         )
 
