@@ -1430,3 +1430,114 @@ async def flowchart(req: FlowchartRequest):
     except Exception as e:
         logger.warning(f"/flowchart  parse failed: {e}  raw={raw[:400]!r}")
         raise HTTPException(status_code=422, detail=f"Could not parse flowchart data: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── /web-search  (auto-detected live queries)
+# ══════════════════════════════════════════════════════════════════════════════
+
+WEB_SEARCH_SYSTEM = """You are Sedy, an AI study assistant. You have been given live web search results.
+Use ONLY the provided search results to answer the question accurately and concisely.
+Always cite which source each fact comes from using [1], [2] etc.
+If the results don't answer the question, say so honestly.
+Use markdown formatting. Keep the answer focused and student-friendly."""
+
+class WebSearchRequest(BaseModel):
+    query: str
+    history: list[HistoryEntry] = []
+
+class WebSearchSource(BaseModel):
+    title: str
+    url: str
+    snippet: str = ""
+
+class WebSearchResponse(BaseModel):
+    reply: str
+    sources: list[WebSearchSource] = []
+    query: str
+
+
+@app.post("/web-search", response_model=WebSearchResponse)
+async def web_search(req: WebSearchRequest):
+    query = req.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query must not be empty")
+
+    if not SERPER_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Web search is not configured on this server. Set SERPER_API_KEY env var."
+        )
+
+    logger.info(f"/web-search  query={query[:80]!r}")
+
+    # ── Fetch search results ──────────────────────────────────────────────────
+    sources: list[WebSearchSource] = []
+    search_context = ""
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            resp = await c.post(
+                "https://google.serper.dev/search",
+                headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                json={"q": query, "num": 6, "gl": "in", "hl": "en"},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                results = data.get("organic", [])
+                # Answer box / knowledge panel
+                answer_box = data.get("answerBox", {})
+                knowledge = data.get("knowledgeGraph", {})
+
+                snippets = []
+                if answer_box:
+                    ab_text = answer_box.get("answer") or answer_box.get("snippet", "")
+                    if ab_text:
+                        snippets.append(f"[Featured Answer] {ab_text}")
+                if knowledge:
+                    kg_desc = knowledge.get("description", "")
+                    if kg_desc:
+                        snippets.append(f"[Knowledge Panel] {kg_desc}")
+
+                for i, r in enumerate(results[:6], 1):
+                    title   = r.get("title", "")
+                    url     = r.get("link", "")
+                    snippet = r.get("snippet", "")
+                    if title or snippet:
+                        snippets.append(f"[{i}] {title}: {snippet}")
+                        sources.append(WebSearchSource(title=title, url=url, snippet=snippet))
+
+                search_context = "\n".join(snippets)
+    except Exception as e:
+        logger.warning(f"/web-search  serper failed: {e}")
+        search_context = ""
+
+    if not search_context:
+        raise HTTPException(
+            status_code=502,
+            detail="Web search failed. Check SERPER_API_KEY and network connectivity."
+        )
+
+    # ── Ask Groq to synthesise an answer ─────────────────────────────────────
+    user_content = f"Question: {query}\n\nLive Search Results:\n{search_context}\n\nAnswer the question using these results."
+    messages = [
+        {"role": "system", "content": WEB_SEARCH_SYSTEM},
+        {"role": "user",   "content": user_content},
+    ]
+
+    try:
+        response = client.chat.completions.create(
+            model=MODELS["pro"],
+            messages=messages,
+            max_tokens=1024,
+            temperature=0.3,
+        )
+    except Exception as e:
+        logger.error(f"Groq error /web-search: {e}")
+        rl = parse_rate_limit_error(e)
+        if rl:
+            raise HTTPException(status_code=429, detail=rl)
+        raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
+
+    reply = strip_think_tags(response.choices[0].message.content.strip())
+    logger.info(f"/web-search  reply_len={len(reply)}  sources={len(sources)}")
+    return WebSearchResponse(reply=reply, sources=sources, query=query)
