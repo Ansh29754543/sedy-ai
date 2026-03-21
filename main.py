@@ -1734,3 +1734,91 @@ async def web_search(req: WebSearchRequest):
     reply = strip_think_tags(groq_response.choices[0].message.content.strip())
     logger.info(f"/web-search  reply_len={len(reply)}  sources={len(sources)}")
     return WebSearchResponse(reply=reply, sources=sources, query=query, fast=False)
+
+# ── /attention-check  (Blink & Learn) ─────────────────────────────────────────
+class AttentionCheckRequest(BaseModel):
+    context: str          # recent AI messages concatenated
+    history: list[HistoryEntry] = []
+
+class AttentionCheckResponse(BaseModel):
+    question: str
+    options: list[str]    # always 3 options
+    answer_index: int     # 0-based index of correct answer
+    explanation: str      # shown after answering
+
+ATTENTION_CHECK_PROMPT = """You are generating a quick comprehension check question for a student who just looked away from their screen.
+
+Based on the recent study content provided, generate ONE short multiple-choice question to check if they were paying attention.
+
+RULES:
+1. The question must be directly answerable from the provided context
+2. Keep it SHORT — max 15 words in the question
+3. Provide exactly 3 answer options — one correct, two plausible but wrong
+4. Keep options SHORT — max 8 words each
+5. The correct answer should be at a random position (not always first)
+6. Write the explanation in 1 sentence max
+7. Match the language of the content (if Hindi content, write in Hindi etc.)
+
+Output ONLY valid JSON, no markdown fences:
+{
+  "question": "...",
+  "options": ["...", "...", "..."],
+  "answer_index": 0,
+  "explanation": "..."
+}"""
+
+@app.post("/attention-check", response_model=AttentionCheckResponse)
+async def attention_check(req: AttentionCheckRequest):
+    """
+    Generates a quick comprehension question based on recent chat content.
+    Called by Blink & Learn when the user looks away for too long.
+    Uses flash model — must be fast (< 1s).
+    """
+    logger.info(f"/attention-check  ctx_len={len(req.context)}")
+
+    if not req.context.strip():
+        raise HTTPException(status_code=400, detail="context is required")
+
+    user_prompt = f"Recent study content:\n{req.context[:800]}\n\nGenerate a comprehension check question."
+
+    try:
+        response = client.chat.completions.create(
+            model=MODELS["flash"],
+            messages=[
+                {"role": "system", "content": ATTENTION_CHECK_PROMPT},
+                {"role": "user",   "content": user_prompt},
+            ],
+            max_tokens=200,
+            temperature=0.6,
+        )
+    except Exception as e:
+        logger.error(f"Groq error /attention-check: {e}")
+        rl = parse_rate_limit_error(e)
+        if rl:
+            raise HTTPException(status_code=429, detail=rl)
+        raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
+
+    raw = response.choices[0].message.content.strip()
+    # Strip markdown fences if model added them
+    raw = raw.replace("```json", "").replace("```", "").strip()
+
+    try:
+        data = json.loads(raw)
+        # Validate structure
+        if not all(k in data for k in ("question", "options", "answer_index", "explanation")):
+            raise ValueError("Missing required fields")
+        if len(data["options"]) != 3:
+            raise ValueError("Need exactly 3 options")
+        if not (0 <= int(data["answer_index"]) <= 2):
+            raise ValueError("answer_index out of range")
+
+        logger.info(f"/attention-check  q={data['question'][:60]!r}")
+        return AttentionCheckResponse(
+            question=str(data["question"]),
+            options=[str(o) for o in data["options"]],
+            answer_index=int(data["answer_index"]),
+            explanation=str(data.get("explanation", "")),
+        )
+    except Exception as e:
+        logger.warning(f"/attention-check  parse failed: {e}  raw={raw[:200]!r}")
+        raise HTTPException(status_code=422, detail=f"Could not parse attention check: {e}")
