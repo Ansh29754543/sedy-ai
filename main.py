@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(me
 logger = logging.getLogger("sedy")
 
 # ── App ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Sedy API", version="4.0.0")
+app = FastAPI(title="Sedy API", version="4.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -58,6 +58,7 @@ AUTO_MODEL_MAP = {
     "intent":    MODELS["flash"],
     "refine":    MODELS["flash"],
     "image":     MODELS["vision"],
+    "voice":     MODELS["flash"],   # NEW — fast model for real-time voice
 }
 
 def resolve_model(requested: str | None, task: str = "chat") -> str:
@@ -431,6 +432,61 @@ Use markdown formatting. Keep the answer short and student-friendly — max 120 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ── VOICE SYSTEM PROMPTS  (NEW)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_voice_system_prompt(
+    persona_name: str,
+    lang_name: str,
+    lang_code: str,
+    is_hinglish: bool,
+    script_hint: str,
+) -> str:
+    """
+    Build a tight, voice-optimised system prompt.
+
+    persona_name : "Aria" | "Nova"
+    lang_name    : human-readable e.g. "Hindi", "Hinglish", "Tamil"
+    lang_code    : BCP-47 base code e.g. "hi", "en", "ta"
+    is_hinglish  : True when mixing Hindi + English romanised
+    script_hint  : e.g. "Devanagari script" | "Tamil script" | "Latin/Roman script"
+    """
+    if is_hinglish:
+        lang_rule = (
+            "The student is speaking Hinglish (Hindi + English mixed).\n"
+            "YOU MUST reply in Hinglish — mix Hindi words naturally with English, "
+            "exactly like a desi friend texting. "
+            "Use romanised Hindi (yaar, bhai, kya, matlab, sahi hai) mixed with English. "
+            "Do NOT use Devanagari script — keep it all in Latin letters."
+        )
+    elif lang_code == "en":
+        lang_rule = "The student is speaking English. Reply in English only."
+    else:
+        lang_rule = (
+            f"The student is speaking {lang_name}.\n"
+            f"YOU MUST reply ENTIRELY in {lang_name} using {script_hint}.\n"
+            f"NEVER switch to English mid-reply.\n"
+            f"Technical terms (like 'photosynthesis', 'algorithm') may stay in English "
+            f"but everything else must be in {lang_name}."
+        )
+
+    return f"""You are {persona_name}, a super friendly AI study buddy on a voice call.
+
+{lang_rule}
+
+VOICE REPLY RULES — follow these exactly:
+1. Keep replies to 1-2 short sentences MAXIMUM — like a quick voice message to a friend.
+2. NO bullet points, NO numbered lists, NO markdown, NO headers.
+3. NO "I" at the start of every sentence — vary your openers.
+4. If explaining something complex, give ONE small piece at a time.
+5. Be warm, casual and encouraging — like a close friend helping out.
+6. If the student says something you didn't understand clearly (possible mic mishear),
+   ask them to repeat just THAT word — don't guess wildly.
+7. NEVER change the language mid-reply — stay locked to {lang_name if not is_hinglish else "Hinglish"}.
+8. Use the conversation history to stay aware of what was already discussed — don't repeat yourself."""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ── PYDANTIC MODELS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -505,7 +561,34 @@ class WebSearchRequest(BaseModel):
     query: str
     history: list[HistoryEntry] = []
 
-# ── Response models ────────────────────────────────────────────────────────────
+# ── NEW: Voice chat request model ──────────────────────────────────────────────
+class VoiceChatRequest(BaseModel):
+    """
+    Dedicated voice chat endpoint.
+
+    message      : the transcribed speech from the user (may contain mishears)
+    persona      : "girl" (Aria) | "boy" (Nova)
+    lang_code    : BCP-47 base detected on the frontend e.g. "hi", "en", "ta", "bn"
+    lang_name    : human-readable language name e.g. "Hindi", "Tamil", "Hinglish"
+    is_hinglish  : True when mixing Hindi + English romanised
+    script_hint  : e.g. "Devanagari script" for Hindi
+    history      : last N voice turns — clean, no [Voice] prefixes
+    """
+    message: str
+    persona: str = "girl"          # "girl" | "boy"
+    lang_code: str = "en"
+    lang_name: str = "English"
+    is_hinglish: bool = False
+    script_hint: str = "Latin script"
+    history: list[HistoryEntry] = []
+
+class VoiceChatResponse(BaseModel):
+    reply: str
+    lang_code: str
+    lang_name: str
+
+
+# ── Response models (unchanged) ───────────────────────────────────────────────
 class ChatResponse(BaseModel):
     reply: str
 
@@ -654,8 +737,69 @@ def build_messages(system: str, history: list[HistoryEntry], user_message: str) 
     return messages
 
 
+def build_voice_messages(
+    system: str,
+    history: list[HistoryEntry],
+    user_message: str,
+) -> list[dict]:
+    """
+    Build message list for voice chat.
+    Strips any leftover [Voice] prefixes from history entries.
+    Keeps only the last 10 turns to stay snappy.
+    """
+    messages = [{"role": "system", "content": system}]
+    trimmed = history[-10:] if len(history) > 10 else history
+    sanitised: list[dict] = []
+    for entry in trimmed:
+        role = entry.role if entry.role in ("user", "assistant") else "user"
+        # Strip [Voice] prefix if frontend accidentally sent it
+        content = re.sub(r'^\[Voice\]\s*', '', entry.content).strip()
+        if not content:
+            continue
+        if sanitised and sanitised[-1]["role"] == role:
+            sanitised[-1]["content"] += " " + content
+        else:
+            sanitised.append({"role": role, "content": content})
+    messages.extend(sanitised)
+    messages.append({"role": "user", "content": user_message})
+    return messages
+
+
 def strip_think_tags(raw: str) -> str:
     return re.sub(r'<think>[\s\S]*?</think>', '', raw).strip()
+
+
+def strip_voice_reply(raw: str) -> str:
+    """
+    Extra cleanup for voice replies:
+    - Remove think tags
+    - Remove markdown (**, ##, -, *, `)
+    - Remove LaTeX delimiters (speak the expression naturally)
+    - Collapse whitespace
+    - Cap to 3 sentences max
+    """
+    text = strip_think_tags(raw)
+    # Remove markdown formatting
+    text = re.sub(r'#{1,3}\s+', '', text)
+    text = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', text)
+    text = re.sub(r'`[^`]+`', '', text)
+    # Replace LaTeX with spoken form
+    text = re.sub(r'\$\$([^$]+)\$\$', r'\1', text)
+    text = re.sub(r'\$([^$]+)\$', r'\1', text)
+    # Remove bullet/list markers
+    text = re.sub(r'^\s*[-•*]\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
+    # Collapse whitespace and newlines
+    text = re.sub(r'\n+', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    # Cap to 3 sentences
+    sentence_endings = re.compile(r'(?<=[.!?।])\s+')
+    sentences = sentence_endings.split(text)
+    if len(sentences) > 3:
+        text = ' '.join(sentences[:3]).strip()
+        if not text.endswith(('.', '!', '?', '।')):
+            text += '.'
+    return text
 
 
 def extract_json_array(raw: str) -> list:
@@ -683,30 +827,19 @@ def strip_json_fences(raw: str) -> str:
 
 
 VAGUE_TOPIC_SIGNALS = [
-    # English
     "it","this","that","them","same","the same","the topic","same topic",
     "this topic","that topic","above","the above","this one","that one",
     "at this basis","based on this","based on that","on this","on that",
-    # Hindi
     "यह","वो","वह","इसके","उसके","यही","वही","इस पर","उस पर","इसी","उसी",
     "यह topic","वह topic","इस विषय","उस विषय","यही विषय",
-    # Bengali
     "এটা","এটি","এই","ওটা","ওটি","একই","এই বিষয়","ওই বিষয়",
-    # Tamil
     "இது","அது","இதே","அதே","இந்த topic","அந்த topic",
-    # Telugu
     "ఇది","అది","ఇదే","అదే","ఈ topic","ఆ topic",
-    # Kannada
     "ಇದು","ಅದು","ಇದೇ","ಅದೇ",
-    # Malayalam
     "ഇത്","അത്","ഇതേ","അതേ",
-    # Marathi
     "हे","ते","हेच","तेच","याच","त्याच",
-    # Gujarati
     "આ","તે","આ જ","તે જ",
-    # Punjabi
     "ਇਹ","ਉਹ","ਇਹੀ","ਉਹੀ",
-    # Urdu
     "یہ","وہ","اسی","اسی موضوع",
 ]
 
@@ -864,11 +997,11 @@ def _prepare_image_url(raw_b64: str) -> str:
 async def root():
     return {
         "status":       "Sedy API is live 🚀",
-        "version":      "4.0.0",
+        "version":      "4.1.0",
         "pdf_engine":   PDF_ENGINE or "none — install pymupdf!",
         "ocr_support":  PDF_ENGINE == "pymupdf",
         "vision_model": MODELS["vision"],
-        "tts":          "client-side (Kokoro ONNX / ElevenLabs)",
+        "tts":          "client-side (Web Speech API)",
         "live_data":    bool(SERPER_API_KEY),
         "languages":    [
             "English", "Hindi", "Bengali", "Tamil", "Telugu", "Kannada",
@@ -876,7 +1009,7 @@ async def root():
             "Assamese", "Sanskrit", "Hinglish"
         ],
         "endpoints": [
-            "/chat", "/flashcards", "/quiz", "/graph", "/pdf-chat",
+            "/chat", "/voice-chat", "/flashcards", "/quiz", "/graph", "/pdf-chat",
             "/intent", "/code-questions", "/notes", "/formula-sheet",
             "/flowchart", "/image-chat", "/web-search",
         ],
@@ -931,6 +1064,71 @@ async def chat(req: ChatRequest):
     reply = strip_think_tags(response.choices[0].message.content.strip())
     logger.info(f"/chat  reply_len={len(reply)}")
     return ChatResponse(reply=reply)
+
+
+# ── /voice-chat  (NEW) ─────────────────────────────────────────────────────────
+@app.post("/voice-chat", response_model=VoiceChatResponse)
+async def voice_chat(req: VoiceChatRequest):
+    """
+    Dedicated voice chat endpoint.
+
+    Key differences from /chat:
+    - Uses flash model for speed (< 1s latency target)
+    - System prompt is voice-optimised: short replies, no markdown, language-locked
+    - History is stripped of [Voice] prefixes and capped at 10 turns
+    - Reply is cleaned with strip_voice_reply() before returning
+    - Language passed explicitly from frontend — no server-side detection needed
+    """
+    persona_name = "Aria" if req.persona == "girl" else "Nova"
+    logger.info(
+        f"/voice-chat  persona={persona_name}  lang={req.lang_code}/{req.lang_name}"
+        f"  hinglish={req.is_hinglish}  msg={req.message[:80]!r}"
+    )
+
+    system = build_voice_system_prompt(
+        persona_name=persona_name,
+        lang_name=req.lang_name,
+        lang_code=req.lang_code,
+        is_hinglish=req.is_hinglish,
+        script_hint=req.script_hint,
+    )
+
+    messages = build_voice_messages(system, req.history, req.message)
+
+    try:
+        response = client.chat.completions.create(
+            model=MODELS["flash"],        # always flash for voice — speed > quality
+            messages=messages,
+            max_tokens=120,               # hard cap — voice replies must be short
+            temperature=0.75,            # slightly creative but consistent
+            stop=["।।", "\n\n"],         # stop at paragraph breaks for Indian langs
+        )
+    except Exception as e:
+        logger.error(f"Groq error /voice-chat: {e}")
+        rl = parse_rate_limit_error(e)
+        if rl:
+            raise HTTPException(status_code=429, detail=rl)
+        raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
+
+    raw   = response.choices[0].message.content.strip()
+    reply = strip_voice_reply(raw)
+
+    # Safety: if reply is empty after stripping, return a language-appropriate fallback
+    if not reply:
+        fallbacks = {
+            "hi": "Samajh nahi aaya, ek baar aur bolo!",
+            "bn": "বুঝলাম না, আবার বলো!",
+            "ta": "புரியவில்லை, மீண்டும் சொல்லுங்கள்!",
+            "te": "అర్థం కాలేదు, మళ్ళీ చెప్పండి!",
+        }
+        reply = fallbacks.get(req.lang_code, "Sorry, say that again?")
+
+    logger.info(f"/voice-chat  reply={reply[:80]!r}  len={len(reply)}")
+    return VoiceChatResponse(
+        reply=reply,
+        lang_code=req.lang_code,
+        lang_name=req.lang_name,
+    )
 
 
 # ── /image-chat ────────────────────────────────────────────────────────────────
@@ -1002,15 +1200,12 @@ async def flashcards(req: FlashcardRequest):
         "Decide how many flashcards are needed to fully cover every important concept. "
         "Simple topics: 8-12 cards. Broad topics: 15-30 cards."
     )
-
-    # Detect language from topic for consistent output
     lang_instruction = (
         "IMPORTANT: Generate the flashcard questions and answers in the same language "
         "as the topic/request. If the topic is in Hindi, write in Hindi. "
         "If in Bengali, write in Bengali. If in Tamil, write in Tamil. Etc. "
         "Default to English if the language is unclear."
     )
-
     user_prompt = (
         f'{count_instr} about "{topic}".\n'
         f'{lang_instruction}\n'
@@ -1067,12 +1262,10 @@ async def quiz(req: QuizRequest):
         if not auto_count else
         f"Decide how many {difficulty} MCQ questions are needed to properly test every concept."
     )
-
     lang_instruction = (
         "IMPORTANT: Generate the quiz questions, options, and explanations in the same language "
         "as the topic/request. Match the student's language exactly."
     )
-
     user_prompt = (
         f'{count_instr} about "{topic}".\n'
         f'{lang_instruction}\n'
@@ -1356,8 +1549,6 @@ async def flowchart(req: FlowchartRequest):
     model = resolve_model(req.model, "flowchart")
     logger.info(f"/flowchart  model={model}  msg={req.message[:80]!r}")
     refined = await refine_prompt(req.message, req.history)
-    # Flowchart node labels must be short — instruct model to use English or transliterated
-    # labels for the SVG nodes, since SVG renders all scripts fine
     user_prompt = (
         f"Create a flowchart for: {refined}\n\n"
         "NOTE: Node labels in the JSON can be in the same language as the request "
