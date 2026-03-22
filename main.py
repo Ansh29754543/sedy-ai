@@ -522,6 +522,7 @@ class ChatRequest(BaseModel):
     message: str
     history: list[HistoryEntry] = []
     model: str = "auto"
+    preferred_language: str = ""  # e.g. "Hindi", "Tamil", "English". Empty = auto-detect.
 
 class FlashcardRequest(BaseModel):
     topic: str
@@ -1072,9 +1073,42 @@ async def detect_intent(req: IntentRequest):
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     model = resolve_model(req.model, "chat")
-    logger.info(f"/chat  model={model}  history={len(req.history)}  msg={req.message[:80]!r}")
+    logger.info(f"/chat  model={model}  history={len(req.history)}  lang={req.preferred_language!r}  msg={req.message[:80]!r}")
+
+    # Build system prompt — override language rules if user has a preference set
+    if req.preferred_language and req.preferred_language.lower() not in ("", "auto"):
+        lang = req.preferred_language.strip()
+        if lang.lower() == "english":
+            # User explicitly wants English — override auto-detect, always reply in English
+            lang_override = """LANGUAGE RULE — USER PREFERENCE (HIGHEST PRIORITY):
+The user has set their preferred language to ENGLISH.
+YOU MUST ALWAYS respond in ENGLISH regardless of:
+- What language the user types in
+- What language appears in the conversation history
+- Any other language signals
+
+Do NOT respond in Hindi, Bengali, Tamil, or any other language.
+Respond in English ONLY. This is a fixed user setting."""
+        else:
+            # User wants a specific Indian/other language
+            lang_override = f"""LANGUAGE RULE — USER PREFERENCE (HIGHEST PRIORITY):
+The user has set their preferred language to {lang}.
+YOU MUST ALWAYS respond in {lang} regardless of what language the user types in.
+Use the correct native script for {lang}.
+Do NOT switch to English or any other language.
+This is a fixed user setting that overrides auto-detection."""
+
+        # Build a custom system prompt with the language override replacing the auto-detect rules
+        system = SYSTEM_PROMPT.replace(
+            SUPPORTED_LANGUAGES,
+            f"\n{lang_override}\n"
+        )
+    else:
+        # No preference — use full auto-detect system prompt
+        system = SYSTEM_PROMPT
+
     refined  = await refine_prompt(req.message, req.history)
-    messages = build_messages(SYSTEM_PROMPT, req.history, refined)
+    messages = build_messages(system, req.history, refined)
     try:
         response = client.chat.completions.create(
             model=model, messages=messages, max_tokens=32768, temperature=0.7,
