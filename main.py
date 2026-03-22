@@ -523,6 +523,7 @@ class ChatRequest(BaseModel):
     history: list[HistoryEntry] = []
     model: str = "auto"
     preferred_language: str = ""  # e.g. "Hindi", "Tamil", "English". Empty = auto-detect.
+    force_language: bool = False  # when True, language override is always applied
 
 class FlashcardRequest(BaseModel):
     topic: str
@@ -934,29 +935,28 @@ async def refine_prompt(message: str, history: list[HistoryEntry],
         logger.warning(f"refine_prompt failed ({e}), using original")
         return message
 
+
+async def refine_graph_prompt(message: str, history: list[HistoryEntry]) -> str:
+    return await refine_prompt(message, history, system_prompt=GRAPH_REFINE_SYSTEM_PROMPT)
+
+
 async def refine_prompt_lang_aware(message: str, history: list[HistoryEntry], preferred_language: str = "") -> str:
     """
     Refine prompt while respecting the user's preferred language.
-    If preferred_language is set, the refinement system prompt is adjusted
-    so it doesn't inject the wrong language into the refined message.
+    If preferred_language is set, tells the refiner NOT to translate —
+    just fix vague references and spelling. The system prompt handles language in the final reply.
     """
     if not preferred_language or preferred_language.lower() in ("", "auto"):
         return await refine_prompt(message, history)
 
-    # Build a language-aware refinement prompt
     lang_note = (
         f"\n\nIMPORTANT: The user's preferred language is {preferred_language}. "
         f"Output the refined message in ENGLISH regardless — the system prompt "
         f"will enforce the language in the final reply. "
         f"Just fix vague references and spelling errors. Do NOT translate the message."
     )
-
     modified_refine_prompt = REFINE_SYSTEM_PROMPT + lang_note
     return await refine_prompt(message, history, system_prompt=modified_refine_prompt)
-
-
-async def refine_graph_prompt(message: str, history: list[HistoryEntry]) -> str:
-    return await refine_prompt(message, history, system_prompt=GRAPH_REFINE_SYSTEM_PROMPT)
 
 
 async def fetch_live_data(query: str) -> str:
@@ -1138,13 +1138,12 @@ YOU ARE AN ENGLISH-ONLY ASSISTANT FOR THIS USER. REPLY IN ENGLISH. ALWAYS."""
             "STRICT MATH FORMATTING (frontend uses KaTeX):\n"
             "- ALL math MUST be wrapped in LaTeX: $...$ inline, $$...$$ display\n"
             "- NEVER write bare math like w^2 — always wrap in $w^2$\n"
-            "- Fractions: $\\frac{a}{b}$  Subscripts: $A_{\\text{base}}$"
+            r"- Fractions: $\frac{a}{b}$  Subscripts: $A_{\text{base}}$"
         )
     else:
         system = SYSTEM_PROMPT
 
     # ── Refine prompt (language-neutral — just fixes vague references) ─────────
-    # Pass preferred_language to refine so it doesn't inject Hindi into the refined message
     refined = await refine_prompt_lang_aware(req.message, req.history, pref_lang)
 
     messages = build_messages(system, req.history, refined)
@@ -1161,6 +1160,7 @@ YOU ARE AN ENGLISH-ONLY ASSISTANT FOR THIS USER. REPLY IN ENGLISH. ALWAYS."""
     reply = strip_think_tags(response.choices[0].message.content.strip())
     logger.info(f"/chat  reply_len={len(reply)}")
     return ChatResponse(reply=reply)
+
 
 # ── /voice-chat  (NEW) ─────────────────────────────────────────────────────────
 @app.post("/voice-chat", response_model=VoiceChatResponse)
