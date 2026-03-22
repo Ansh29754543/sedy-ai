@@ -934,6 +934,26 @@ async def refine_prompt(message: str, history: list[HistoryEntry],
         logger.warning(f"refine_prompt failed ({e}), using original")
         return message
 
+async def refine_prompt_lang_aware(message: str, history: list[HistoryEntry], preferred_language: str = "") -> str:
+    """
+    Refine prompt while respecting the user's preferred language.
+    If preferred_language is set, the refinement system prompt is adjusted
+    so it doesn't inject the wrong language into the refined message.
+    """
+    if not preferred_language or preferred_language.lower() in ("", "auto"):
+        return await refine_prompt(message, history)
+
+    # Build a language-aware refinement prompt
+    lang_note = (
+        f"\n\nIMPORTANT: The user's preferred language is {preferred_language}. "
+        f"Output the refined message in ENGLISH regardless — the system prompt "
+        f"will enforce the language in the final reply. "
+        f"Just fix vague references and spelling errors. Do NOT translate the message."
+    )
+
+    modified_refine_prompt = REFINE_SYSTEM_PROMPT + lang_note
+    return await refine_prompt(message, history, system_prompt=modified_refine_prompt)
+
 
 async def refine_graph_prompt(message: str, history: list[HistoryEntry]) -> str:
     return await refine_prompt(message, history, system_prompt=GRAPH_REFINE_SYSTEM_PROMPT)
@@ -1075,39 +1095,58 @@ async def chat(req: ChatRequest):
     model = resolve_model(req.model, "chat")
     logger.info(f"/chat  model={model}  history={len(req.history)}  lang={req.preferred_language!r}  msg={req.message[:80]!r}")
 
-    # Build system prompt — override language rules if user has a preference set
-    if req.preferred_language and req.preferred_language.lower() not in ("", "auto"):
-        lang = req.preferred_language.strip()
-        if lang.lower() == "english":
-            # User explicitly wants English — override auto-detect, always reply in English
-            lang_override = """LANGUAGE RULE — USER PREFERENCE (HIGHEST PRIORITY):
-The user has set their preferred language to ENGLISH.
-YOU MUST ALWAYS respond in ENGLISH regardless of:
-- What language the user types in
-- What language appears in the conversation history
-- Any other language signals
+    pref_lang = (req.preferred_language or "").strip()
+    pref_lang_lower = pref_lang.lower()
 
-Do NOT respond in Hindi, Bengali, Tamil, or any other language.
-Respond in English ONLY. This is a fixed user setting."""
+    # ── Build language-locked system prompt ───────────────────────────────────
+    if pref_lang and pref_lang_lower not in ("", "auto"):
+        if pref_lang_lower == "english":
+            lang_override = """LANGUAGE RULE — ABSOLUTE OVERRIDE (HIGHEST PRIORITY — NON-NEGOTIABLE):
+The user has EXPLICITLY chosen English as their preferred language in Settings.
+YOU MUST RESPOND IN ENGLISH ONLY. ALWAYS. NO EXCEPTIONS.
+
+This means:
+- Respond in English even if the user's message is in Hindi, Bengali, Tamil or any other language
+- Respond in English even if the conversation history contains messages in other languages
+- NEVER switch to Hindi, Bengali, Tamil, Telugu, Kannada, Malayalam, Marathi, Gujarati, Punjabi, Urdu or ANY other language
+- NEVER mix languages — pure English only
+- This setting OVERRIDES all auto-language-detection
+- Ignore ALL language signals in the message or history
+
+YOU ARE AN ENGLISH-ONLY ASSISTANT FOR THIS USER. REPLY IN ENGLISH. ALWAYS."""
         else:
-            # User wants a specific Indian/other language
-            lang_override = f"""LANGUAGE RULE — USER PREFERENCE (HIGHEST PRIORITY):
-The user has set their preferred language to {lang}.
-YOU MUST ALWAYS respond in {lang} regardless of what language the user types in.
-Use the correct native script for {lang}.
-Do NOT switch to English or any other language.
-This is a fixed user setting that overrides auto-detection."""
+            lang_override = (
+                f"LANGUAGE RULE — ABSOLUTE OVERRIDE (HIGHEST PRIORITY — NON-NEGOTIABLE):\n"
+                f"The user has EXPLICITLY chosen {pref_lang} as their preferred language in Settings.\n"
+                f"YOU MUST RESPOND ENTIRELY IN {pref_lang.upper()} USING THE CORRECT NATIVE SCRIPT.\n"
+                f"This OVERRIDES all auto-detection. Do NOT switch to English or any other language.\n"
+                f"Even if the user types in English, reply in {pref_lang}."
+            )
 
-        # Build a custom system prompt with the language override replacing the auto-detect rules
-        system = SYSTEM_PROMPT.replace(
-            SUPPORTED_LANGUAGES,
-            f"\n{lang_override}\n"
+        system = (
+            "You are Sedy, an intelligent student learning assistant made by Ansh Verma, a school student.\n"
+            "You explain concepts clearly and simply, solve math and science problems step by step,\n"
+            "summarize topics, and help students understand programming.\n"
+            "Always be encouraging, clear and educational.\n"
+            "Only reveal your identity when asked.\n\n"
+            + lang_override + "\n\n"
+            "IMPORTANT RULES:\n"
+            "- Use markdown formatting: headers (##), bold (**text**), bullet points (- item), code blocks (```language)\n"
+            "- NEVER describe flashcards or quizzes in plain text — the frontend handles those separately\n"
+            "- Keep responses focused and well structured\n"
+            "- Use conversation history for context when user refers to 'it', 'that', 'same topic'\n\n"
+            "STRICT MATH FORMATTING (frontend uses KaTeX):\n"
+            "- ALL math MUST be wrapped in LaTeX: $...$ inline, $$...$$ display\n"
+            "- NEVER write bare math like w^2 — always wrap in $w^2$\n"
+            "- Fractions: $\\frac{a}{b}$  Subscripts: $A_{\\text{base}}$"
         )
     else:
-        # No preference — use full auto-detect system prompt
         system = SYSTEM_PROMPT
 
-    refined  = await refine_prompt(req.message, req.history)
+    # ── Refine prompt (language-neutral — just fixes vague references) ─────────
+    # Pass preferred_language to refine so it doesn't inject Hindi into the refined message
+    refined = await refine_prompt_lang_aware(req.message, req.history, pref_lang)
+
     messages = build_messages(system, req.history, refined)
     try:
         response = client.chat.completions.create(
@@ -1122,7 +1161,6 @@ This is a fixed user setting that overrides auto-detection."""
     reply = strip_think_tags(response.choices[0].message.content.strip())
     logger.info(f"/chat  reply_len={len(reply)}")
     return ChatResponse(reply=reply)
-
 
 # ── /voice-chat  (NEW) ─────────────────────────────────────────────────────────
 @app.post("/voice-chat", response_model=VoiceChatResponse)
