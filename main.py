@@ -344,7 +344,7 @@ YOUR RULES:
 7. If the PDF contains text in an Indian language, read and respond in that same language."""
 
 INTENT_SYSTEM_PROMPT = """You are an intent classifier for a student learning app.
-Output EXACTLY one word from: graph, flashcard, quiz, both, notes, formula, flowchart, chat
+Output EXACTLY one word from: graph, flashcard, quiz, both, notes, formula, flowchart, practice, chat
 
 graph     = user EXPLICITLY asks for a chart, graph, plot, bar chart, pie chart, line graph, or data visualisation.
             Also matches: ग्राफ, चार्ट, গ্রাফ, வரைபடம், గ్రాఫ్
@@ -359,10 +359,18 @@ formula   = wants a formula sheet, key terms, definitions list, cheat sheet, or 
             Also matches: सूत्र, সূত্র, சூத்திரம், సూత్రాలు
 flowchart = user asks for a flowchart, flow diagram, process diagram, diagram of a process
             Also matches: फ्लोचार्ट, প্রবাহচিত্র, ஓட்டப்படம்
+practice  = user wants to PRACTICE, SOLVE problems, do EXERCISES, or get QUESTIONS to solve on whiteboard
+            Key signals: "practice", "practise", "solve problems", "give me questions", "let me try",
+            "I want to practice", "practice questions", "exercise problems", "solve on whiteboard",
+            "whiteboard practice", "let me solve", "give problems to solve", "test me on solving"
+            Also matches: अभ्यास, प्रैक्टिस, প্র্যাকটিস, பயிற்சி, సాధన, ಅಭ್ಯಾಸ
+            IMPORTANT: If user says "practice [topic]" or "practice on [topic]" or "I want to practice [topic]" → practice
 chat      = everything else
 
 CRITICAL:
-- Math questions, explanations, "solve this" → chat
+- "Solve this [specific problem]" → chat (they want the answer, not practice)
+- "Practice [topic]" or "give me problems to practice" → practice
+- Math questions, explanations, "what is X", "explain X" → chat
 - Only "graph" if user literally asks for a chart
 - Only "flowchart" if user wants a visual process diagram
 - Works for ALL languages: English, Hindi, Bengali, Tamil, Telugu, Kannada, Malayalam, Marathi, Gujarati, Punjabi, Urdu, Odia
@@ -1051,7 +1059,7 @@ async def detect_intent(req: IntentRequest):
             max_tokens=5, temperature=0.0,
         )
         raw    = response.choices[0].message.content.strip().lower()
-        valid  = ("graph", "flashcard", "quiz", "both", "notes", "formula", "flowchart", "chat")
+        valid  = ("graph", "flashcard", "quiz", "both", "notes", "formula", "flowchart", "practice", "chat")
         intent = raw if raw in valid else "chat"
         logger.info(f"/intent  result={intent!r}")
         return IntentResponse(intent=intent)
