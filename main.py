@@ -2,6 +2,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import Groq
+import random
+import string
+import hashlib
 import json
 import os
 import logging
@@ -16,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(me
 logger = logging.getLogger("sedy")
 
 # ── App ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Sedy API", version="4.1.0")
+app = FastAPI(title="Sedy API", version="5.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1042,12 +1045,13 @@ def _prepare_image_url(raw_b64: str) -> str:
 async def root():
     return {
         "status":       "Sedy API is live 🚀",
-        "version":      "4.1.0",
+        "version":      "5.0.0",
         "pdf_engine":   PDF_ENGINE or "none — install pymupdf!",
         "ocr_support":  PDF_ENGINE == "pymupdf",
         "vision_model": MODELS["vision"],
         "tts":          "client-side (Web Speech API)",
         "live_data":    bool(SERPER_API_KEY),
+        "classroom":    True,
         "languages":    [
             "English", "Hindi", "Bengali", "Tamil", "Telugu", "Kannada",
             "Malayalam", "Marathi", "Gujarati", "Punjabi", "Urdu", "Odia",
@@ -1056,7 +1060,10 @@ async def root():
         "endpoints": [
             "/chat", "/voice-chat", "/flashcards", "/quiz", "/graph", "/pdf-chat",
             "/intent", "/code-questions", "/notes", "/formula-sheet",
-            "/flowchart", "/image-chat", "/web-search",
+            "/flowchart", "/image-chat", "/web-search", "/attention-check",
+            "/school/generate-code", "/school/parse-timetable",
+            "/school/summarize-material", "/school/answer-doubt",
+            "/school/draft-announcement",
         ],
     }
 
@@ -1902,3 +1909,423 @@ async def attention_check(req: AttentionCheckRequest):
     except Exception as e:
         logger.warning(f"/attention-check  parse failed: {e}  raw={raw[:200]!r}")
         raise HTTPException(status_code=422, detail=f"Could not parse attention check: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── SEDY CLASSROOM — School Management System
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# FIRESTORE STRUCTURE:
+#   schools/{schoolCode}/
+#     name, principalUid, principalName, active, plan, createdAt, memberCount
+#     members/{uid}/ → name, email, role, class, joinedAt
+#     classes/{classId}/ → name, classTeacherUid, classTeacherName, subjects[]
+#     timetable/ → raw text, parsed JSON of teacher→subject→class mappings
+#     announcements/{id}/ → text, authorName, authorRole, targetClasses[], createdAt
+#     classrooms/{classId}/
+#       materials/{materialId}/ → title, type, uploadedBy, fileUrl, summary, createdAt
+#       doubts/{doubtId}/ → question, studentUid, studentName, answer, answeredBy, createdAt
+#
+# ALL FIRESTORE READS/WRITES HAPPEN FROM THE FRONTEND using Firebase SDK.
+# The backend only does AI processing:
+#   /school/parse-timetable  → AI reads timetable image/text → returns structured JSON
+#   /school/summarize-material → AI summarizes uploaded document for students
+#   /school/answer-doubt → AI answers from class materials context
+#   /school/generate-code → generates a unique school join code
+
+def generate_school_code(school_name: str) -> str:
+    """
+    Generates a unique, readable school join code.
+    Format: SEDY-XXXX where XXXX is 4 uppercase alphanumeric chars.
+    Uses school name as seed so same name doesn't always get same code.
+    """
+    prefix = "SEDY"
+    chars  = string.ascii_uppercase + string.digits
+    # Seed with name + random for uniqueness
+    random.seed(school_name + str(random.random()))
+    suffix = ''.join(random.choices(chars, k=4))
+    return f"{prefix}-{suffix}"
+
+
+# ── Timetable Parser System Prompt ────────────────────────────────────────────
+
+TIMETABLE_PARSE_PROMPT = """You are an expert school timetable parser. You will be given the text content of a school timetable.
+
+Your job is to extract a structured JSON of all teacher-subject-class assignments.
+
+Output ONLY a valid JSON object with this exact structure — no markdown, no explanation:
+{
+  "school_name": "extracted school name or empty string",
+  "classes": ["8A", "9B", "10C"],
+  "teachers": [
+    {
+      "name": "Teacher Full Name",
+      "subjects": ["Mathematics", "Physics"],
+      "classes": ["8A", "9B"],
+      "assignments": [
+        {"class": "8A", "subject": "Mathematics", "periods_per_week": 5},
+        {"class": "9B", "subject": "Physics", "periods_per_week": 4}
+      ]
+    }
+  ],
+  "summary": "Brief 1-sentence summary of what was parsed"
+}
+
+RULES:
+1. Extract every teacher name and which classes/subjects they teach
+2. If periods per week is not clear, default to 0
+3. Normalize class names (8A not "class 8 section A")
+4. Normalize subject names (Mathematics not "Math / Maths")
+5. If the same teacher teaches multiple subjects, list all of them
+6. Output ONLY the JSON — no other text"""
+
+
+MATERIAL_SUMMARY_PROMPT = """You are an AI study assistant summarizing a classroom document for students.
+
+Create a concise, student-friendly summary of the uploaded material.
+
+FORMAT:
+## 📚 Summary
+2-3 sentence overview of what this material covers.
+
+## 🔑 Key Points
+- Point 1
+- Point 2
+- Point 3
+(up to 8 key points)
+
+## ❓ Likely Questions
+List 3 questions a student might ask about this material.
+
+Keep the language simple and educational. Match the language of the document if it's in Hindi/regional language."""
+
+
+DOUBT_ANSWER_PROMPT = """You are a helpful AI classroom assistant. A student has asked a doubt about their class material.
+
+You have been given:
+1. The student's question
+2. The relevant class material (uploaded by their teacher)
+
+Answer the question using ONLY the provided class material. Be clear, step-by-step, and student-friendly.
+If the answer is not in the material, say: "This topic isn't covered in the uploaded material. Ask your teacher directly."
+
+Use markdown formatting. For maths, use LaTeX ($...$).
+Match the student's language."""
+
+
+# ── School Pydantic Models ─────────────────────────────────────────────────────
+
+class SchoolCreateRequest(BaseModel):
+    school_name:     str
+    principal_uid:   str
+    principal_name:  str
+    principal_email: str = ""
+
+class SchoolCreateResponse(BaseModel):
+    code:        str   # e.g. "SEDY-XK29"
+    school_name: str
+    message:     str
+
+class TimetableParseRequest(BaseModel):
+    text:        str   # raw timetable text (extracted from PDF/image on frontend)
+    school_code: str = ""
+    images:      list[str] = []  # base64 images if timetable is image-based
+
+class TimetableParseResponse(BaseModel):
+    school_name: str
+    classes:     list[str]
+    teachers:    list[dict]
+    summary:     str
+    raw_json:    str  # full JSON string for frontend to save to Firestore
+
+class MaterialSummaryRequest(BaseModel):
+    material_text: str   # extracted text from the uploaded document
+    material_name: str = "Class Material"
+    subject:       str = ""
+    class_name:    str = ""
+    preferred_language: str = "English"
+
+class MaterialSummaryResponse(BaseModel):
+    summary: str
+    subject: str
+    class_name: str
+
+class DoubtAnswerRequest(BaseModel):
+    question:            str
+    material_context:    str   # text from relevant class materials
+    subject:             str = ""
+    class_name:          str = ""
+    student_name:        str = ""
+    preferred_language:  str = "English"
+
+class DoubtAnswerResponse(BaseModel):
+    answer:      str
+    answered_by: str = "Sedy AI"
+
+class AnnouncementDraftRequest(BaseModel):
+    """AI helps principal/teacher write a clear announcement"""
+    raw_text:      str   # rough idea of what to announce
+    author_role:   str = "principal"  # "principal" | "teacher"
+    target:        str = "all"        # "all" | "class 9A" | "teachers"
+    preferred_language: str = "English"
+
+class AnnouncementDraftResponse(BaseModel):
+    announcement: str
+
+
+# ── School Code Generation ─────────────────────────────────────────────────────
+
+@app.post("/school/generate-code", response_model=SchoolCreateResponse)
+async def school_generate_code(req: SchoolCreateRequest):
+    """
+    Generates a unique school join code.
+    Called when a principal creates a school from the Upgrades → School Setup page.
+    The frontend then saves the school document to Firestore with this code as the document ID.
+    """
+    if not req.school_name.strip():
+        raise HTTPException(status_code=400, detail="school_name is required")
+    if not req.principal_uid.strip():
+        raise HTTPException(status_code=400, detail="principal_uid is required")
+
+    code = generate_school_code(req.school_name)
+    logger.info(f"/school/generate-code  name={req.school_name!r}  code={code}  uid={req.principal_uid}")
+
+    return SchoolCreateResponse(
+        code=code,
+        school_name=req.school_name.strip(),
+        message=f"School code generated successfully. Share {code} with your students and teachers.",
+    )
+
+
+# ── Timetable Parser ──────────────────────────────────────────────────────────
+
+@app.post("/school/parse-timetable", response_model=TimetableParseResponse)
+async def school_parse_timetable(req: TimetableParseRequest):
+    """
+    Parses a school timetable (text or image) and returns structured teacher→subject→class data.
+    Called by principal after uploading their timetable PDF/image.
+    """
+    logger.info(f"/school/parse-timetable  text_len={len(req.text)}  images={len(req.images)}")
+
+    if not req.text.strip() and not req.images:
+        raise HTTPException(status_code=400, detail="Either text or images must be provided")
+
+    # Build content for the AI
+    if req.images:
+        # Image-based timetable — use vision model
+        content: list[dict] = []
+        for raw_b64 in req.images[:3]:
+            try:
+                image_url = _prepare_image_url(raw_b64)
+                content.append({"type": "image_url", "image_url": {"url": image_url}})
+            except Exception as e:
+                logger.warning(f"Timetable image prep failed: {e}")
+
+        if req.text.strip():
+            content.append({"type": "text", "text": f"Timetable text:\n{req.text[:3000]}\n\nParse this timetable and return JSON."})
+        else:
+            content.append({"type": "text", "text": "Parse this timetable image and return the structured JSON."})
+
+        messages = [
+            {"role": "system", "content": TIMETABLE_PARSE_PROMPT},
+            {"role": "user",   "content": content},
+        ]
+        model_to_use = MODELS["vision"]
+    else:
+        # Text-based timetable
+        messages = [
+            {"role": "system", "content": TIMETABLE_PARSE_PROMPT},
+            {"role": "user",   "content": f"Parse this timetable:\n\n{req.text[:4000]}"},
+        ]
+        model_to_use = MODELS["smart"]  # qwen is better at structured extraction
+
+    try:
+        response = client.chat.completions.create(
+            model=model_to_use,
+            messages=messages,
+            max_tokens=4096,
+            temperature=0.1,  # low temperature for accurate extraction
+        )
+    except Exception as e:
+        logger.error(f"Groq error /school/parse-timetable: {e}")
+        rl = parse_rate_limit_error(e)
+        if rl:
+            raise HTTPException(status_code=429, detail=rl)
+        raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
+
+    raw = strip_think_tags(response.choices[0].message.content.strip())
+    raw = raw.replace("```json", "").replace("```", "").strip()
+
+    try:
+        data = json.loads(raw)
+        return TimetableParseResponse(
+            school_name = str(data.get("school_name", "")),
+            classes     = [str(c) for c in data.get("classes", [])],
+            teachers    = data.get("teachers", []),
+            summary     = str(data.get("summary", "Timetable parsed successfully.")),
+            raw_json    = json.dumps(data),
+        )
+    except Exception as e:
+        logger.warning(f"/school/parse-timetable  parse failed: {e}  raw={raw[:300]!r}")
+        # Return partial response with raw text so frontend can still show something
+        return TimetableParseResponse(
+            school_name = "",
+            classes     = [],
+            teachers    = [],
+            summary     = "Could not parse timetable automatically. Please review the raw output.",
+            raw_json    = json.dumps({"raw": raw, "error": str(e)}),
+        )
+
+
+# ── Material Summarizer ───────────────────────────────────────────────────────
+
+@app.post("/school/summarize-material", response_model=MaterialSummaryResponse)
+async def school_summarize_material(req: MaterialSummaryRequest):
+    """
+    Summarizes a class material document uploaded by a teacher.
+    Students get this summary automatically when the teacher uploads.
+    Uses the teacher's preferred language.
+    """
+    logger.info(f"/school/summarize-material  subject={req.subject!r}  class={req.class_name!r}  len={len(req.material_text)}")
+
+    if not req.material_text.strip():
+        raise HTTPException(status_code=400, detail="material_text is required")
+
+    # Truncate to avoid token limits
+    text = req.material_text[:8000]
+    context_line = ""
+    if req.subject:   context_line += f"Subject: {req.subject}\n"
+    if req.class_name: context_line += f"Class: {req.class_name}\n"
+
+    lang_note = ""
+    if req.preferred_language and req.preferred_language != "English":
+        lang_note = f"\n\nIMPORTANT: Write the summary in {req.preferred_language}."
+
+    user_prompt = f"{context_line}\nMaterial content:\n{text}{lang_note}"
+
+    try:
+        response = client.chat.completions.create(
+            model=MODELS["pro"],
+            messages=[
+                {"role": "system", "content": MATERIAL_SUMMARY_PROMPT},
+                {"role": "user",   "content": user_prompt},
+            ],
+            max_tokens=1024,
+            temperature=0.4,
+        )
+    except Exception as e:
+        logger.error(f"Groq error /school/summarize-material: {e}")
+        rl = parse_rate_limit_error(e)
+        if rl:
+            raise HTTPException(status_code=429, detail=rl)
+        raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
+
+    summary = strip_think_tags(response.choices[0].message.content.strip())
+    logger.info(f"/school/summarize-material  summary_len={len(summary)}")
+
+    return MaterialSummaryResponse(
+        summary    = summary,
+        subject    = req.subject,
+        class_name = req.class_name,
+    )
+
+
+# ── Doubt Answerer ────────────────────────────────────────────────────────────
+
+@app.post("/school/answer-doubt", response_model=DoubtAnswerResponse)
+async def school_answer_doubt(req: DoubtAnswerRequest):
+    """
+    Answers a student's doubt using the class material as context.
+    If the answer is not in the material, tells the student to ask their teacher.
+    This is the RAG (Retrieval Augmented Generation) endpoint for classroom.
+    """
+    logger.info(f"/school/answer-doubt  subject={req.subject!r}  q={req.question[:80]!r}")
+
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="question is required")
+
+    context_header = ""
+    if req.subject:    context_header += f"Subject: {req.subject}\n"
+    if req.class_name: context_header += f"Class: {req.class_name}\n"
+    if req.student_name: context_header += f"Student: {req.student_name}\n"
+
+    lang_note = ""
+    if req.preferred_language and req.preferred_language != "English":
+        lang_note = f"\n\nRespond in {req.preferred_language}."
+
+    material_section = ""
+    if req.material_context.strip():
+        material_section = f"\n\n=== CLASS MATERIAL ===\n{req.material_context[:6000]}\n=== END MATERIAL ==="
+    else:
+        material_section = "\n\n[No class material provided — answer from general knowledge but note the limitation]"
+
+    user_prompt = f"{context_header}\nStudent question: {req.question}{material_section}{lang_note}"
+
+    try:
+        response = client.chat.completions.create(
+            model=MODELS["pro"],
+            messages=[
+                {"role": "system", "content": DOUBT_ANSWER_PROMPT},
+                {"role": "user",   "content": user_prompt},
+            ],
+            max_tokens=2048,
+            temperature=0.4,
+        )
+    except Exception as e:
+        logger.error(f"Groq error /school/answer-doubt: {e}")
+        rl = parse_rate_limit_error(e)
+        if rl:
+            raise HTTPException(status_code=429, detail=rl)
+        raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
+
+    answer = strip_think_tags(response.choices[0].message.content.strip())
+    logger.info(f"/school/answer-doubt  answer_len={len(answer)}")
+
+    return DoubtAnswerResponse(
+        answer      = answer,
+        answered_by = "Sedy AI",
+    )
+
+
+# ── Announcement Drafter ──────────────────────────────────────────────────────
+
+@app.post("/school/draft-announcement", response_model=AnnouncementDraftResponse)
+async def school_draft_announcement(req: AnnouncementDraftRequest):
+    """
+    Helps a principal or teacher write a clear, professional announcement.
+    Takes their rough idea and returns a polished version.
+    """
+    logger.info(f"/school/draft-announcement  role={req.author_role!r}  target={req.target!r}")
+
+    if not req.raw_text.strip():
+        raise HTTPException(status_code=400, detail="raw_text is required")
+
+    lang_note = ""
+    if req.preferred_language and req.preferred_language != "English":
+        lang_note = f" Write the announcement in {req.preferred_language}."
+
+    system = f"""You are helping a school {req.author_role} write a clear announcement for {req.target}.
+Transform their rough notes into a well-written, professional yet warm school announcement.
+Keep it concise — 2-4 sentences max.
+No bullet points. Direct and clear.{lang_note}
+Output ONLY the announcement text — no subject line, no greetings, just the body."""
+
+    try:
+        response = client.chat.completions.create(
+            model=MODELS["pro"],
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": f"Write this as an announcement:\n{req.raw_text}"},
+            ],
+            max_tokens=300,
+            temperature=0.5,
+        )
+    except Exception as e:
+        logger.error(f"Groq error /school/draft-announcement: {e}")
+        rl = parse_rate_limit_error(e)
+        if rl:
+            raise HTTPException(status_code=429, detail=rl)
+        raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
+
+    announcement = strip_think_tags(response.choices[0].message.content.strip())
+    return AnnouncementDraftResponse(announcement=announcement)
