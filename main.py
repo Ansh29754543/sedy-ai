@@ -61,7 +61,7 @@ AUTO_MODEL_MAP = {
     "intent":    MODELS["flash"],
     "refine":    MODELS["flash"],
     "image":     MODELS["vision"],
-    "voice":     MODELS["flash"],   # NEW — fast model for real-time voice
+    "voice":     MODELS["flash"],
 }
 
 def resolve_model(requested: str | None, task: str = "chat") -> str:
@@ -174,6 +174,36 @@ LANGUAGE RULES:
 5. Technical terms (like "algorithm", "photosynthesis") can stay in English within the response
 6. If student code-switches (Hinglish, Tanglish etc.), match their style naturally
 """
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── LANGUAGE OVERRIDE HELPER  ← NEW
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_lang_override(preferred_language: str) -> str:
+    """
+    Returns a strong language-enforcement instruction string.
+    Used by all special endpoints (flashcards, quiz, notes, formula, flowchart, graph).
+    Returns empty string when no preference is set (auto-detect fallback).
+    """
+    lang = (preferred_language or "").strip()
+    if not lang or lang.lower() in ("", "auto"):
+        return ""
+    if lang.lower() == "english":
+        return (
+            "\n\nLANGUAGE RULE — ABSOLUTE OVERRIDE (NON-NEGOTIABLE):\n"
+            "The user has chosen English as their preferred language.\n"
+            "YOU MUST RESPOND ENTIRELY IN ENGLISH.\n"
+            "Do NOT use Hindi, Bengali, Tamil, or any other language — pure English only.\n"
+            "This overrides all auto-detection."
+        )
+    return (
+        f"\n\nLANGUAGE RULE — ABSOLUTE OVERRIDE (NON-NEGOTIABLE):\n"
+        f"The user has chosen {lang} as their preferred language.\n"
+        f"YOU MUST RESPOND ENTIRELY IN {lang.upper()} using the correct native script.\n"
+        f"Do NOT switch to English or any other language — even if the topic is in English.\n"
+        f"This overrides all auto-detection."
+    )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── SYSTEM PROMPTS
@@ -443,7 +473,7 @@ Use markdown formatting. Keep the answer short and student-friendly — max 120 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── VOICE SYSTEM PROMPTS  (NEW)
+# ── VOICE SYSTEM PROMPTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_voice_system_prompt(
@@ -453,15 +483,6 @@ def build_voice_system_prompt(
     is_hinglish: bool,
     script_hint: str,
 ) -> str:
-    """
-    Build a tight, voice-optimised system prompt.
-
-    persona_name : "Aria" | "Nova"
-    lang_name    : human-readable e.g. "Hindi", "Hinglish", "Tamil"
-    lang_code    : BCP-47 base code e.g. "hi", "en", "ta"
-    is_hinglish  : True when mixing Hindi + English romanised
-    script_hint  : e.g. "Devanagari script" | "Tamil script" | "Latin/Roman script"
-    """
     if is_hinglish:
         lang_rule = (
             "The student is speaking Hinglish (Hindi + English mixed).\n"
@@ -525,14 +546,15 @@ class ChatRequest(BaseModel):
     message: str
     history: list[HistoryEntry] = []
     model: str = "auto"
-    preferred_language: str = ""  # e.g. "Hindi", "Tamil", "English". Empty = auto-detect.
-    force_language: bool = False  # when True, language override is always applied
+    preferred_language: str = ""
+    force_language: bool = False
 
 class FlashcardRequest(BaseModel):
     topic: str
     count: int = 6
     history: list[HistoryEntry] = []
     model: str = "auto"
+    preferred_language: str = ""   # ← FIXED: now accepted from frontend
 
 class QuizRequest(BaseModel):
     topic: str
@@ -540,12 +562,14 @@ class QuizRequest(BaseModel):
     count: int = 5
     history: list[HistoryEntry] = []
     model: str = "auto"
+    preferred_language: str = ""   # ← FIXED
 
 class GraphRequest(BaseModel):
     message: str
     chart_type: str = "auto"
     history: list[HistoryEntry] = []
     model: str = "auto"
+    preferred_language: str = ""   # ← FIXED
 
 class PdfChatRequest(BaseModel):
     message: str
@@ -560,6 +584,7 @@ class NotesRequest(BaseModel):
     model: str = "auto"
     pdf_base64: str = ""
     pdf_name: str = ""
+    preferred_language: str = ""   # ← FIXED
 
 class FormulaRequest(BaseModel):
     topic: str
@@ -567,6 +592,7 @@ class FormulaRequest(BaseModel):
     model: str = "auto"
     pdf_base64: str = ""
     pdf_name: str = ""
+    preferred_language: str = ""   # ← FIXED
 
 class IntentRequest(BaseModel):
     message: str
@@ -585,26 +611,15 @@ class FlowchartRequest(BaseModel):
     message: str
     history: list[HistoryEntry] = []
     model: str = "auto"
+    preferred_language: str = ""   # ← FIXED
 
 class WebSearchRequest(BaseModel):
     query: str
     history: list[HistoryEntry] = []
 
-# ── NEW: Voice chat request model ──────────────────────────────────────────────
 class VoiceChatRequest(BaseModel):
-    """
-    Dedicated voice chat endpoint.
-
-    message      : the transcribed speech from the user (may contain mishears)
-    persona      : "girl" (Aria) | "boy" (Nova)
-    lang_code    : BCP-47 base detected on the frontend e.g. "hi", "en", "ta", "bn"
-    lang_name    : human-readable language name e.g. "Hindi", "Tamil", "Hinglish"
-    is_hinglish  : True when mixing Hindi + English romanised
-    script_hint  : e.g. "Devanagari script" for Hindi
-    history      : last N voice turns — clean, no [Voice] prefixes
-    """
     message: str
-    persona: str = "girl"          # "girl" | "boy"
+    persona: str = "girl"
     lang_code: str = "en"
     lang_name: str = "English"
     is_hinglish: bool = False
@@ -617,7 +632,7 @@ class VoiceChatResponse(BaseModel):
     lang_name: str
 
 
-# ── Response models (unchanged) ───────────────────────────────────────────────
+# ── Response models ───────────────────────────────────────────────────────────
 class ChatResponse(BaseModel):
     reply: str
 
@@ -771,17 +786,11 @@ def build_voice_messages(
     history: list[HistoryEntry],
     user_message: str,
 ) -> list[dict]:
-    """
-    Build message list for voice chat.
-    Strips any leftover [Voice] prefixes from history entries.
-    Keeps only the last 10 turns to stay snappy.
-    """
     messages = [{"role": "system", "content": system}]
     trimmed = history[-10:] if len(history) > 10 else history
     sanitised: list[dict] = []
     for entry in trimmed:
         role = entry.role if entry.role in ("user", "assistant") else "user"
-        # Strip [Voice] prefix if frontend accidentally sent it
         content = re.sub(r'^\[Voice\]\s*', '', entry.content).strip()
         if not content:
             continue
@@ -799,29 +808,16 @@ def strip_think_tags(raw: str) -> str:
 
 
 def strip_voice_reply(raw: str) -> str:
-    """
-    Extra cleanup for voice replies:
-    - Remove think tags
-    - Remove markdown (**, ##, -, *, `)
-    - Remove LaTeX delimiters (speak the expression naturally)
-    - Collapse whitespace
-    - Cap to 3 sentences max
-    """
     text = strip_think_tags(raw)
-    # Remove markdown formatting
     text = re.sub(r'#{1,3}\s+', '', text)
     text = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', text)
     text = re.sub(r'`[^`]+`', '', text)
-    # Replace LaTeX with spoken form
     text = re.sub(r'\$\$([^$]+)\$\$', r'\1', text)
     text = re.sub(r'\$([^$]+)\$', r'\1', text)
-    # Remove bullet/list markers
     text = re.sub(r'^\s*[-•*]\s+', '', text, flags=re.MULTILINE)
     text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
-    # Collapse whitespace and newlines
     text = re.sub(r'\n+', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
-    # Cap to 3 sentences
     sentence_endings = re.compile(r'(?<=[.!?।])\s+')
     sentences = sentence_endings.split(text)
     if len(sentences) > 3:
@@ -944,11 +940,6 @@ async def refine_graph_prompt(message: str, history: list[HistoryEntry]) -> str:
 
 
 async def refine_prompt_lang_aware(message: str, history: list[HistoryEntry], preferred_language: str = "") -> str:
-    """
-    Refine prompt while respecting the user's preferred language.
-    If preferred_language is set, tells the refiner NOT to translate —
-    just fix vague references and spelling. The system prompt handles language in the final reply.
-    """
     if not preferred_language or preferred_language.lower() in ("", "auto"):
         return await refine_prompt(message, history)
 
@@ -1105,7 +1096,6 @@ async def chat(req: ChatRequest):
     pref_lang = (req.preferred_language or "").strip()
     pref_lang_lower = pref_lang.lower()
 
-    # ── Build language-locked system prompt ───────────────────────────────────
     if pref_lang and pref_lang_lower not in ("", "auto"):
         if pref_lang_lower == "english":
             lang_override = """LANGUAGE RULE — ABSOLUTE OVERRIDE (HIGHEST PRIORITY — NON-NEGOTIABLE):
@@ -1150,7 +1140,6 @@ YOU ARE AN ENGLISH-ONLY ASSISTANT FOR THIS USER. REPLY IN ENGLISH. ALWAYS."""
     else:
         system = SYSTEM_PROMPT
 
-    # ── Refine prompt (language-neutral — just fixes vague references) ─────────
     refined = await refine_prompt_lang_aware(req.message, req.history, pref_lang)
 
     messages = build_messages(system, req.history, refined)
@@ -1169,19 +1158,9 @@ YOU ARE AN ENGLISH-ONLY ASSISTANT FOR THIS USER. REPLY IN ENGLISH. ALWAYS."""
     return ChatResponse(reply=reply)
 
 
-# ── /voice-chat  (NEW) ─────────────────────────────────────────────────────────
+# ── /voice-chat ────────────────────────────────────────────────────────────────
 @app.post("/voice-chat", response_model=VoiceChatResponse)
 async def voice_chat(req: VoiceChatRequest):
-    """
-    Dedicated voice chat endpoint.
-
-    Key differences from /chat:
-    - Uses flash model for speed (< 1s latency target)
-    - System prompt is voice-optimised: short replies, no markdown, language-locked
-    - History is stripped of [Voice] prefixes and capped at 10 turns
-    - Reply is cleaned with strip_voice_reply() before returning
-    - Language passed explicitly from frontend — no server-side detection needed
-    """
     persona_name = "Aria" if req.persona == "girl" else "Nova"
     logger.info(
         f"/voice-chat  persona={persona_name}  lang={req.lang_code}/{req.lang_name}"
@@ -1200,11 +1179,11 @@ async def voice_chat(req: VoiceChatRequest):
 
     try:
         response = client.chat.completions.create(
-            model=MODELS["pro"],          # pro model for voice — better instruction following, less hallucination
+            model=MODELS["pro"],
             messages=messages,
-            max_tokens=150,               # hard cap — voice replies must be short
-            temperature=0.5,             # lower = more factual, less creative hallucination
-            stop=["।।", "\n\n"],         # stop at paragraph breaks for Indian langs
+            max_tokens=150,
+            temperature=0.5,
+            stop=["।।", "\n\n"],
         )
     except Exception as e:
         logger.error(f"Groq error /voice-chat: {e}")
@@ -1216,7 +1195,6 @@ async def voice_chat(req: VoiceChatRequest):
     raw   = response.choices[0].message.content.strip()
     reply = strip_voice_reply(raw)
 
-    # Safety: if reply is empty after stripping, return a language-appropriate fallback
     if not reply:
         fallbacks = {
             "hi": "Samajh nahi aaya, ek baar aur bolo!",
@@ -1287,7 +1265,8 @@ async def image_chat(req: ImageChatRequest):
 @app.post("/flashcards", response_model=FlashcardResponse)
 async def flashcards(req: FlashcardRequest):
     model = resolve_model(req.model, "flashcard")
-    logger.info(f"/flashcards  model={model}  topic={req.topic!r}")
+    logger.info(f"/flashcards  model={model}  topic={req.topic!r}  lang={req.preferred_language!r}")
+
     topic_as_prompt = f"Generate flashcards about {req.topic.strip()}"
     refined = await refine_prompt(topic_as_prompt, req.history)
     m = re.search(r'(?:flashcards?\s+(?:about|on|for)\s+|flashcards?\s+)(.+)', refined, re.I)
@@ -1295,6 +1274,7 @@ async def flashcards(req: FlashcardRequest):
     topic = resolve_topic_from_history(topic, req.history)
     if not topic:
         raise HTTPException(status_code=400, detail="topic must not be empty")
+
     auto_count = req.count == 0
     count = max(1, min(req.count, 50)) if not auto_count else 0
     count_instr = (
@@ -1303,12 +1283,19 @@ async def flashcards(req: FlashcardRequest):
         "Decide how many flashcards are needed to fully cover every important concept. "
         "Simple topics: 8-12 cards. Broad topics: 15-30 cards."
     )
-    lang_instruction = (
-        "IMPORTANT: Generate the flashcard questions and answers in the same language "
-        "as the topic/request. If the topic is in Hindi, write in Hindi. "
-        "If in Bengali, write in Bengali. If in Tamil, write in Tamil. Etc. "
-        "Default to English if the language is unclear."
-    )
+
+    # ── Language instruction — preferred_language takes priority ──────────────
+    lang_override = build_lang_override(req.preferred_language)
+    if lang_override:
+        lang_instruction = lang_override
+    else:
+        lang_instruction = (
+            "\n\nIMPORTANT: Generate the flashcard questions and answers in the same language "
+            "as the topic/request. If the topic is in Hindi, write in Hindi. "
+            "If in Bengali, write in Bengali. If in Tamil, write in Tamil. Etc. "
+            "Default to English if the language is unclear."
+        )
+
     user_prompt = (
         f'{count_instr} about "{topic}".\n'
         f'{lang_instruction}\n'
@@ -1316,6 +1303,7 @@ async def flashcards(req: FlashcardRequest):
         f'Return ONLY a valid JSON array:\n'
         f'[{{"question":"...","answer":"..."}}]'
     )
+
     try:
         response = client.chat.completions.create(
             model=model,
@@ -1328,6 +1316,7 @@ async def flashcards(req: FlashcardRequest):
         if rl:
             raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
+
     raw = response.choices[0].message.content.strip()
     try:
         data  = extract_json_array(raw)
@@ -1341,6 +1330,7 @@ async def flashcards(req: FlashcardRequest):
         cards = [c for c in cards if c.question and c.answer]
     except Exception:
         cards = [Flashcard(question=f"What is {topic}?", answer=raw[:300])]
+
     logger.info(f"/flashcards  generated {len(cards)} cards")
     return FlashcardResponse(cards=cards, topic=topic)
 
@@ -1349,7 +1339,8 @@ async def flashcards(req: FlashcardRequest):
 @app.post("/quiz", response_model=QuizResponse)
 async def quiz(req: QuizRequest):
     model = resolve_model(req.model, "quiz")
-    logger.info(f"/quiz  model={model}  topic={req.topic!r}")
+    logger.info(f"/quiz  model={model}  topic={req.topic!r}  lang={req.preferred_language!r}")
+
     topic_as_prompt = f"Quiz me on {req.topic.strip()}"
     refined = await refine_prompt(topic_as_prompt, req.history)
     m = re.search(r'(?:quiz\s+(?:me\s+)?(?:on|about)\s+)(.+)', refined, re.I)
@@ -1357,6 +1348,7 @@ async def quiz(req: QuizRequest):
     topic = resolve_topic_from_history(topic, req.history)
     if not topic:
         raise HTTPException(status_code=400, detail="topic must not be empty")
+
     difficulty = req.difficulty if req.difficulty in ("easy", "medium", "hard") else "medium"
     auto_count = req.count == 0
     count = max(1, min(req.count, 50)) if not auto_count else 0
@@ -1365,10 +1357,17 @@ async def quiz(req: QuizRequest):
         if not auto_count else
         f"Decide how many {difficulty} MCQ questions are needed to properly test every concept."
     )
-    lang_instruction = (
-        "IMPORTANT: Generate the quiz questions, options, and explanations in the same language "
-        "as the topic/request. Match the student's language exactly."
-    )
+
+    # ── Language instruction ───────────────────────────────────────────────────
+    lang_override = build_lang_override(req.preferred_language)
+    if lang_override:
+        lang_instruction = lang_override
+    else:
+        lang_instruction = (
+            "\n\nIMPORTANT: Generate the quiz questions, options, and explanations in the same language "
+            "as the topic/request. Match the student's language exactly."
+        )
+
     user_prompt = (
         f'{count_instr} about "{topic}".\n'
         f'{lang_instruction}\n'
@@ -1376,6 +1375,7 @@ async def quiz(req: QuizRequest):
         f'Return ONLY a valid JSON array:\n'
         f'[{{"question":"...","options":["A","B","C","D"],"answer":0,"explanation":"..."}}]'
     )
+
     try:
         response = client.chat.completions.create(
             model=model,
@@ -1388,6 +1388,7 @@ async def quiz(req: QuizRequest):
         if rl:
             raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
+
     raw = response.choices[0].message.content.strip()
     try:
         data      = extract_json_array(raw)
@@ -1412,6 +1413,7 @@ async def quiz(req: QuizRequest):
             answer=0,
             explanation=raw[:300],
         )]
+
     logger.info(f"/quiz  generated {len(questions)} questions")
     return QuizResponse(questions=questions, topic=topic, difficulty=difficulty)
 
@@ -1420,7 +1422,8 @@ async def quiz(req: QuizRequest):
 @app.post("/graph", response_model=GraphResponse)
 async def graph(req: GraphRequest):
     model = resolve_model(req.model, "graph")
-    logger.info(f"/graph  model={model}  msg={req.message[:80]!r}")
+    logger.info(f"/graph  model={model}  msg={req.message[:80]!r}  lang={req.preferred_language!r}")
+
     refined = await refine_graph_prompt(req.message, req.history)
     live_snippets = ""
     data_source   = "estimated"
@@ -1428,14 +1431,22 @@ async def graph(req: GraphRequest):
         live_snippets = await fetch_live_data(refined + " data statistics numbers")
         if live_snippets:
             data_source = "live"
+
+    # Graph data labels stay in English, but title/caption can respect language
+    lang_note = build_lang_override(req.preferred_language)
+    graph_system = GRAPH_SYSTEM_PROMPT
+    if lang_note:
+        graph_system += f"\n\nNOTE: The chart title and caption should be in the user's preferred language if specified. Data labels (x/y values) stay in English.{lang_note}"
+
     user_content = (
         f"User request: {refined}\n\nReal-time data (use where possible):\n{live_snippets}\n\nGenerate chart JSON."
         if live_snippets else refined
     )
+
     try:
         response = client.chat.completions.create(
             model=model,
-            messages=[{"role": "system", "content": GRAPH_SYSTEM_PROMPT}, {"role": "user", "content": user_content}],
+            messages=[{"role": "system", "content": graph_system}, {"role": "user", "content": user_content}],
             max_tokens=32768, temperature=0.3,
         )
     except Exception as e:
@@ -1444,6 +1455,7 @@ async def graph(req: GraphRequest):
         if rl:
             raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
+
     raw = strip_json_fences(response.choices[0].message.content.strip())
     try:
         obj         = json.loads(raw)
@@ -1572,10 +1584,15 @@ async def code_questions(req: CodeQuestionsRequest):
 @app.post("/notes", response_model=NotesResponse)
 async def generate_notes(req: NotesRequest):
     model = resolve_model(req.model, "notes")
-    logger.info(f"/notes  model={model}  topic={req.topic!r}")
+    logger.info(f"/notes  model={model}  topic={req.topic!r}  lang={req.preferred_language!r}")
+
     topic = req.topic.strip()
     if not topic:
         raise HTTPException(status_code=400, detail="topic must not be empty")
+
+    # ── Language-aware system prompt ──────────────────────────────────────────
+    notes_system = NOTES_SYSTEM_PROMPT + build_lang_override(req.preferred_language)
+
     if req.pdf_base64:
         pdf_bytes = _decode_pdf_base64(req.pdf_base64)
         pdf_text, page_count = _validate_and_extract_pdf(pdf_bytes, req.pdf_name or "document.pdf")
@@ -1587,11 +1604,12 @@ async def generate_notes(req: NotesRequest):
         )
     else:
         user_prompt = f'Generate comprehensive study notes on: "{topic}"'
+
     try:
         response = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": NOTES_SYSTEM_PROMPT},
+                {"role": "system", "content": notes_system},
                 {"role": "user",   "content": user_prompt},
             ],
             max_tokens=32768, temperature=0.5,
@@ -1602,6 +1620,7 @@ async def generate_notes(req: NotesRequest):
         if rl:
             raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
+
     notes = strip_think_tags(response.choices[0].message.content.strip())
     logger.info(f"/notes  reply_len={len(notes)}")
     return NotesResponse(notes=notes, topic=topic)
@@ -1611,10 +1630,15 @@ async def generate_notes(req: NotesRequest):
 @app.post("/formula-sheet", response_model=FormulaResponse)
 async def formula_sheet(req: FormulaRequest):
     model = resolve_model(req.model, "formula")
-    logger.info(f"/formula-sheet  model={model}  topic={req.topic!r}")
+    logger.info(f"/formula-sheet  model={model}  topic={req.topic!r}  lang={req.preferred_language!r}")
+
     topic = req.topic.strip()
     if not topic:
         raise HTTPException(status_code=400, detail="topic must not be empty")
+
+    # ── Language-aware system prompt ──────────────────────────────────────────
+    formula_system = FORMULA_SYSTEM_PROMPT + build_lang_override(req.preferred_language)
+
     if req.pdf_base64:
         pdf_bytes = _decode_pdf_base64(req.pdf_base64)
         pdf_text, page_count = _validate_and_extract_pdf(pdf_bytes, req.pdf_name or "document.pdf")
@@ -1626,11 +1650,12 @@ async def formula_sheet(req: FormulaRequest):
         )
     else:
         user_prompt = f'Generate a complete formula and key terms reference sheet for: "{topic}"'
+
     try:
         response = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": FORMULA_SYSTEM_PROMPT},
+                {"role": "system", "content": formula_system},
                 {"role": "user",   "content": user_prompt},
             ],
             max_tokens=32768, temperature=0.3,
@@ -1641,6 +1666,7 @@ async def formula_sheet(req: FormulaRequest):
         if rl:
             raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
+
     sheet = strip_think_tags(response.choices[0].message.content.strip())
     logger.info(f"/formula-sheet  reply_len={len(sheet)}")
     return FormulaResponse(sheet=sheet, topic=topic)
@@ -1650,14 +1676,18 @@ async def formula_sheet(req: FormulaRequest):
 @app.post("/flowchart", response_model=FlowchartResponse)
 async def flowchart(req: FlowchartRequest):
     model = resolve_model(req.model, "flowchart")
-    logger.info(f"/flowchart  model={model}  msg={req.message[:80]!r}")
+    logger.info(f"/flowchart  model={model}  msg={req.message[:80]!r}  lang={req.preferred_language!r}")
+
     refined = await refine_prompt(req.message, req.history)
+
+    lang_note = build_lang_override(req.preferred_language)
     user_prompt = (
         f"Create a flowchart for: {refined}\n\n"
         "NOTE: Node labels in the JSON can be in the same language as the request "
         "(Hindi/Bengali/Tamil etc.) — use short native-script labels where appropriate. "
-        "Keep each label under 25 characters."
+        f"Keep each label under 25 characters.{lang_note}"
     )
+
     try:
         response = client.chat.completions.create(
             model=model,
@@ -1673,6 +1703,7 @@ async def flowchart(req: FlowchartRequest):
         if rl:
             raise HTTPException(status_code=429, detail=rl)
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
+
     raw = strip_json_fences(response.choices[0].message.content.strip())
     try:
         obj = json.loads(raw)
@@ -1822,16 +1853,17 @@ async def web_search(req: WebSearchRequest):
     logger.info(f"/web-search  reply_len={len(reply)}  sources={len(sources)}")
     return WebSearchResponse(reply=reply, sources=sources, query=query, fast=False)
 
-# ── /attention-check  (Blink & Learn) ─────────────────────────────────────────
+
+# ── /attention-check ──────────────────────────────────────────────────────────
 class AttentionCheckRequest(BaseModel):
-    context: str          # recent AI messages concatenated
+    context: str
     history: list[HistoryEntry] = []
 
 class AttentionCheckResponse(BaseModel):
     question: str
-    options: list[str]    # always 3 options
-    answer_index: int     # 0-based index of correct answer
-    explanation: str      # shown after answering
+    options: list[str]
+    answer_index: int
+    explanation: str
 
 ATTENTION_CHECK_PROMPT = """You are generating a quick comprehension check question for a student who just looked away from their screen.
 
@@ -1856,11 +1888,6 @@ Output ONLY valid JSON, no markdown fences:
 
 @app.post("/attention-check", response_model=AttentionCheckResponse)
 async def attention_check(req: AttentionCheckRequest):
-    """
-    Generates a quick comprehension question based on recent chat content.
-    Called by Blink & Learn when the user looks away for too long.
-    Uses flash model — must be fast (< 1s).
-    """
     logger.info(f"/attention-check  ctx_len={len(req.context)}")
 
     if not req.context.strip():
@@ -1886,12 +1913,10 @@ async def attention_check(req: AttentionCheckRequest):
         raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
 
     raw = response.choices[0].message.content.strip()
-    # Strip markdown fences if model added them
     raw = raw.replace("```json", "").replace("```", "").strip()
 
     try:
         data = json.loads(raw)
-        # Validate structure
         if not all(k in data for k in ("question", "options", "answer_index", "explanation")):
             raise ValueError("Missing required fields")
         if len(data["options"]) != 3:
@@ -1912,42 +1937,16 @@ async def attention_check(req: AttentionCheckRequest):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── SEDY CLASSROOM — School Management System
+# ── SEDY CLASSROOM
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# FIRESTORE STRUCTURE:
-#   schools/{schoolCode}/
-#     name, principalUid, principalName, active, plan, createdAt, memberCount
-#     members/{uid}/ → name, email, role, class, joinedAt
-#     classes/{classId}/ → name, classTeacherUid, classTeacherName, subjects[]
-#     timetable/ → raw text, parsed JSON of teacher→subject→class mappings
-#     announcements/{id}/ → text, authorName, authorRole, targetClasses[], createdAt
-#     classrooms/{classId}/
-#       materials/{materialId}/ → title, type, uploadedBy, fileUrl, summary, createdAt
-#       doubts/{doubtId}/ → question, studentUid, studentName, answer, answeredBy, createdAt
-#
-# ALL FIRESTORE READS/WRITES HAPPEN FROM THE FRONTEND using Firebase SDK.
-# The backend only does AI processing:
-#   /school/parse-timetable  → AI reads timetable image/text → returns structured JSON
-#   /school/summarize-material → AI summarizes uploaded document for students
-#   /school/answer-doubt → AI answers from class materials context
-#   /school/generate-code → generates a unique school join code
 
 def generate_school_code(school_name: str) -> str:
-    """
-    Generates a unique, readable school join code.
-    Format: SEDY-XXXX where XXXX is 4 uppercase alphanumeric chars.
-    Uses school name as seed so same name doesn't always get same code.
-    """
     prefix = "SEDY"
     chars  = string.ascii_uppercase + string.digits
-    # Seed with name + random for uniqueness
     random.seed(school_name + str(random.random()))
     suffix = ''.join(random.choices(chars, k=4))
     return f"{prefix}-{suffix}"
 
-
-# ── Timetable Parser System Prompt ────────────────────────────────────────────
 
 TIMETABLE_PARSE_PROMPT = """You are an expert school timetable parser. You will be given the text content of a school timetable.
 
@@ -2013,8 +2012,6 @@ Use markdown formatting. For maths, use LaTeX ($...$).
 Match the student's language."""
 
 
-# ── School Pydantic Models ─────────────────────────────────────────────────────
-
 class SchoolCreateRequest(BaseModel):
     school_name:     str
     principal_uid:   str
@@ -2022,24 +2019,24 @@ class SchoolCreateRequest(BaseModel):
     principal_email: str = ""
 
 class SchoolCreateResponse(BaseModel):
-    code:        str   # e.g. "SEDY-XK29"
+    code:        str
     school_name: str
     message:     str
 
 class TimetableParseRequest(BaseModel):
-    text:        str   # raw timetable text (extracted from PDF/image on frontend)
+    text:        str
     school_code: str = ""
-    images:      list[str] = []  # base64 images if timetable is image-based
+    images:      list[str] = []
 
 class TimetableParseResponse(BaseModel):
     school_name: str
     classes:     list[str]
     teachers:    list[dict]
     summary:     str
-    raw_json:    str  # full JSON string for frontend to save to Firestore
+    raw_json:    str
 
 class MaterialSummaryRequest(BaseModel):
-    material_text: str   # extracted text from the uploaded document
+    material_text: str
     material_name: str = "Class Material"
     subject:       str = ""
     class_name:    str = ""
@@ -2052,7 +2049,7 @@ class MaterialSummaryResponse(BaseModel):
 
 class DoubtAnswerRequest(BaseModel):
     question:            str
-    material_context:    str   # text from relevant class materials
+    material_context:    str
     subject:             str = ""
     class_name:          str = ""
     student_name:        str = ""
@@ -2063,25 +2060,17 @@ class DoubtAnswerResponse(BaseModel):
     answered_by: str = "Sedy AI"
 
 class AnnouncementDraftRequest(BaseModel):
-    """AI helps principal/teacher write a clear announcement"""
-    raw_text:      str   # rough idea of what to announce
-    author_role:   str = "principal"  # "principal" | "teacher"
-    target:        str = "all"        # "all" | "class 9A" | "teachers"
+    raw_text:      str
+    author_role:   str = "principal"
+    target:        str = "all"
     preferred_language: str = "English"
 
 class AnnouncementDraftResponse(BaseModel):
     announcement: str
 
 
-# ── School Code Generation ─────────────────────────────────────────────────────
-
 @app.post("/school/generate-code", response_model=SchoolCreateResponse)
 async def school_generate_code(req: SchoolCreateRequest):
-    """
-    Generates a unique school join code.
-    Called when a principal creates a school from the Upgrades → School Setup page.
-    The frontend then saves the school document to Firestore with this code as the document ID.
-    """
     if not req.school_name.strip():
         raise HTTPException(status_code=400, detail="school_name is required")
     if not req.principal_uid.strip():
@@ -2097,22 +2086,14 @@ async def school_generate_code(req: SchoolCreateRequest):
     )
 
 
-# ── Timetable Parser ──────────────────────────────────────────────────────────
-
 @app.post("/school/parse-timetable", response_model=TimetableParseResponse)
 async def school_parse_timetable(req: TimetableParseRequest):
-    """
-    Parses a school timetable (text or image) and returns structured teacher→subject→class data.
-    Called by principal after uploading their timetable PDF/image.
-    """
     logger.info(f"/school/parse-timetable  text_len={len(req.text)}  images={len(req.images)}")
 
     if not req.text.strip() and not req.images:
         raise HTTPException(status_code=400, detail="Either text or images must be provided")
 
-    # Build content for the AI
     if req.images:
-        # Image-based timetable — use vision model
         content: list[dict] = []
         for raw_b64 in req.images[:3]:
             try:
@@ -2132,19 +2113,18 @@ async def school_parse_timetable(req: TimetableParseRequest):
         ]
         model_to_use = MODELS["vision"]
     else:
-        # Text-based timetable
         messages = [
             {"role": "system", "content": TIMETABLE_PARSE_PROMPT},
             {"role": "user",   "content": f"Parse this timetable:\n\n{req.text[:4000]}"},
         ]
-        model_to_use = MODELS["smart"]  # qwen is better at structured extraction
+        model_to_use = MODELS["smart"]
 
     try:
         response = client.chat.completions.create(
             model=model_to_use,
             messages=messages,
             max_tokens=4096,
-            temperature=0.1,  # low temperature for accurate extraction
+            temperature=0.1,
         )
     except Exception as e:
         logger.error(f"Groq error /school/parse-timetable: {e}")
@@ -2167,7 +2147,6 @@ async def school_parse_timetable(req: TimetableParseRequest):
         )
     except Exception as e:
         logger.warning(f"/school/parse-timetable  parse failed: {e}  raw={raw[:300]!r}")
-        # Return partial response with raw text so frontend can still show something
         return TimetableParseResponse(
             school_name = "",
             classes     = [],
@@ -2177,24 +2156,16 @@ async def school_parse_timetable(req: TimetableParseRequest):
         )
 
 
-# ── Material Summarizer ───────────────────────────────────────────────────────
-
 @app.post("/school/summarize-material", response_model=MaterialSummaryResponse)
 async def school_summarize_material(req: MaterialSummaryRequest):
-    """
-    Summarizes a class material document uploaded by a teacher.
-    Students get this summary automatically when the teacher uploads.
-    Uses the teacher's preferred language.
-    """
     logger.info(f"/school/summarize-material  subject={req.subject!r}  class={req.class_name!r}  len={len(req.material_text)}")
 
     if not req.material_text.strip():
         raise HTTPException(status_code=400, detail="material_text is required")
 
-    # Truncate to avoid token limits
     text = req.material_text[:8000]
     context_line = ""
-    if req.subject:   context_line += f"Subject: {req.subject}\n"
+    if req.subject:    context_line += f"Subject: {req.subject}\n"
     if req.class_name: context_line += f"Class: {req.class_name}\n"
 
     lang_note = ""
@@ -2230,23 +2201,16 @@ async def school_summarize_material(req: MaterialSummaryRequest):
     )
 
 
-# ── Doubt Answerer ────────────────────────────────────────────────────────────
-
 @app.post("/school/answer-doubt", response_model=DoubtAnswerResponse)
 async def school_answer_doubt(req: DoubtAnswerRequest):
-    """
-    Answers a student's doubt using the class material as context.
-    If the answer is not in the material, tells the student to ask their teacher.
-    This is the RAG (Retrieval Augmented Generation) endpoint for classroom.
-    """
     logger.info(f"/school/answer-doubt  subject={req.subject!r}  q={req.question[:80]!r}")
 
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="question is required")
 
     context_header = ""
-    if req.subject:    context_header += f"Subject: {req.subject}\n"
-    if req.class_name: context_header += f"Class: {req.class_name}\n"
+    if req.subject:      context_header += f"Subject: {req.subject}\n"
+    if req.class_name:   context_header += f"Class: {req.class_name}\n"
     if req.student_name: context_header += f"Student: {req.student_name}\n"
 
     lang_note = ""
@@ -2287,14 +2251,8 @@ async def school_answer_doubt(req: DoubtAnswerRequest):
     )
 
 
-# ── Announcement Drafter ──────────────────────────────────────────────────────
-
 @app.post("/school/draft-announcement", response_model=AnnouncementDraftResponse)
 async def school_draft_announcement(req: AnnouncementDraftRequest):
-    """
-    Helps a principal or teacher write a clear, professional announcement.
-    Takes their rough idea and returns a polished version.
-    """
     logger.info(f"/school/draft-announcement  role={req.author_role!r}  target={req.target!r}")
 
     if not req.raw_text.strip():
